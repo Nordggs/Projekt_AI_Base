@@ -400,3 +400,11 @@ pre {
   -webkit-user-select: text;
   cursor: text;
 }
+
+.version {
+  font-size: 11px;
+  color: #4a5568;
+  margin-top: 8px;
+  user-select: text;
+  -webkit-user-select: text;
+}
