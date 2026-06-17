@@ -82,6 +82,12 @@ class App:
         self._connect_error = None
         self._last_watched_url = ""
         self._export_active = False
+        self._output_folders = {
+            "deepseek": "raw/deepseek",
+            "chatgpt": "raw/chatgpt",
+            "gemini": "raw/gemini",
+            "claude": "raw/claude",
+        }
 
         threading.Thread(target=self._pw_worker, daemon=True).start()
 
@@ -113,6 +119,23 @@ class App:
             """)
         except Exception:
             return False
+
+    # ── Page resolver (find sidebar page, not export tab) ──
+
+    def _main_page(self):
+        try:
+            if not self.pw:
+                return None
+            for p in self.pw._context.pages:
+                try:
+                    url = p.url
+                    if "chat.deepseek.com" in url and "/chat/s/" not in url:
+                        return p
+                except Exception:
+                    continue
+            return self.pw.page if hasattr(self.pw, "page") else None
+        except Exception:
+            return None
 
     # ── Playwright worker (single thread, sole owner of self.pw) ──
 
@@ -199,6 +222,28 @@ class App:
     def _export_one(self, url):
         self.log.add(f"[INFO] Exporting {url[:60]}...")
 
+        # scroll sidebar until target URL appears in visible DOM
+        try:
+            mp = self._main_page()
+            if mp:
+                target_url = url.rstrip("/")
+                for _ in range(60):
+                    urls = mp.evaluate("""
+                        () => [...document.querySelectorAll('a[href*="/chat/s/"]')]
+                            .map(a => 'https://chat.deepseek.com' + a.getAttribute('href'))
+                    """)
+                    if any(target_url in (u or "") for u in (urls or [])):
+                        break
+                    mp.evaluate("""
+                        () => {
+                            const c = document.querySelector('.ds-virtual-list');
+                            if (c) c.scrollTop += 300;
+                        }
+                    """)
+                    time_module.sleep(0.2)
+        except Exception:
+            pass
+
         page = None
         try:
             page = self.pw.new_page()
@@ -248,12 +293,17 @@ class App:
             return
 
         self._export_active = True
+        self.writer = ExportWriter(out_dir=self._output_folders["deepseek"])
         ok = 0
         for url in urls:
             if self._export_one(url):
                 ok += 1
         self.log.add(f"[INFO] Batch done: {ok}/{len(urls)} OK")
         self._push_log(f"Batch done: {ok}/{len(urls)} OK")
+        try:
+            self.window.evaluate_js("copyLogContent()")
+        except Exception:
+            pass
 
     # ── URL watcher (runs in _pw_worker idle loop) ──
 
@@ -261,7 +311,10 @@ class App:
         if not self.pw:
             return
         try:
-            url = self.pw.page.evaluate("() => location.href")
+            mp = self._main_page()
+            if not mp:
+                return
+            url = mp.evaluate("() => location.href")
             if url == self._last_watched_url:
                 return
             self._last_watched_url = url
@@ -283,10 +336,11 @@ class App:
     # ── Hybrid discovery (runs in _pw_worker via _export_batch) ──
 
     def _discover_sidebar_urls(self):
-        if not self.pw:
+        mp = self._main_page()
+        if not mp:
             return []
         try:
-            urls = self.pw.page.evaluate("""
+            urls = mp.evaluate("""
                 () => [...new Set(
                     [...document.querySelectorAll('a[href*="/chat/s/"]')]
                         .map(a => 'https://chat.deepseek.com' + a.getAttribute('href'))
@@ -303,7 +357,8 @@ class App:
             return []
 
     def _discover_all_chat_urls(self):
-        if not self.pw:
+        mp = self._main_page()
+        if not mp:
             return []
         try:
             all_urls = set()
@@ -314,7 +369,7 @@ class App:
             SCROLL_STEP = 300
 
             for i in range(MAX_ITER):
-                urls = self.pw.page.evaluate("""
+                urls = mp.evaluate("""
                     () => [...new Set(
                         [...document.querySelectorAll('a[href*="/chat/s/"]')]
                             .map(a => 'https://chat.deepseek.com' + a.getAttribute('href'))
@@ -331,7 +386,7 @@ class App:
                     seen_hashes |= current
                     all_urls |= current
 
-                self.pw.page.evaluate("""
+                mp.evaluate("""
                     () => {
                         const c = document.querySelector('.ds-virtual-list, [class*="sidebar"]');
                         if (c) c.scrollTop += arguments[0];
@@ -415,8 +470,9 @@ class App:
         self._push_log(f"snapshot → {self.ui_snapshot_path}")
 
     def _push_log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
         try:
-            self.window.evaluate_js(f"pushLog({json.dumps(msg)})")
+            self.window.evaluate_js(f"pushLog({json.dumps(f'[{ts}] {msg}')})")
         except Exception:
             pass
 

@@ -22,14 +22,25 @@ class BrowserPlaywright:
             user_data_dir=self.user_data_dir,
             headless=self.headless,
             viewport={"width": 1200, "height": 800},
+            color_scheme="dark",
+            args=[
+                "--force-dark-mode",
+                "--enable-features=WebUIDarkMode",
+                "--disable-features=UseChromeOSDirectVideoDecoder",
+            ],
         )
+        self._context.add_init_script("""
+            localStorage.setItem('theme', 'dark');
+            document.documentElement.classList.add('dark');
+            document.documentElement.dataset.theme = 'dark';
+            document.documentElement.style.colorScheme = 'dark';
+        """)
         self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
         if self.log:
             self.log.add("[INFO] Playwright context ready")
 
     def new_page(self):
-        self._page = self._context.new_page()
-        return self._page
+        return self._context.new_page()
 
     @property
     def page(self):
