@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Chat Saver</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+  <!-- MODAL (hidden by default) -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Подключить аккаунт</h3>
+      <label for="accountUrl">URL DeepSeek:</label>
+      <input id="accountUrl" placeholder="https://chat.deepseek.com/" />
+      <div id="modalError" class="hidden" style="color:#f55;font-size:12px;margin-bottom:8px;"></div>
+      <div class="modal-actions">
+        <button class="primary" onclick="submitAccount()">Подключить</button>
+        <button class="cancel" onclick="closeModal()">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="app">
+
+    <!-- TOP BAR -->
+    <div class="topbar">
+      <div class="title">
+        AI Chat Saver
+        <span class="subtitle">LOCAL MARKDOWN EXPORTER</span>
+      </div>
+
+      <button class="sync-all" onclick="syncAll()">
+        Синхронизировать всё
+      </button>
+    </div>
+
+    <!-- PROVIDERS -->
+    <div class="grid">
+
+      <!-- CHATGPT -->
+      <div class="card chatgpt">
+        <div class="card-header">
+          <h2>ChatGPT</h2>
+          <span class="badge">Нет аккаунтов</span>
+          <button class="small" onclick="addAccount('chatgpt')">+ аккаунт</button>
+        </div>
+
+        <div class="empty">
+          Добавьте профиль аккаунта для авторизации.
+        </div>
+
+        <button class="primary" disabled>Синхронизировать ChatGPT</button>
+      </div>
+
+      <!-- GEMINI -->
+      <div class="card disabled">
+        <div class="card-header">
+          <h2>Gemini</h2>
+          <span class="badge">Нет аккаунтов</span>
+          <button class="small" onclick="addAccount('gemini')">+ аккаунт</button>
+        </div>
+
+        <div class="empty">
+          Добавьте профиль аккаунта для авторизации.
+        </div>
+
+        <button class="primary" disabled>Синхронизировать Gemini</button>
+      </div>
+
+      <!-- CLAUDE -->
+      <div class="card disabled">
+        <div class="card-header">
+          <h2>Claude</h2>
+          <span class="badge">Нет аккаунтов</span>
+          <button class="small" onclick="addAccount('claude')">+ аккаунт</button>
+        </div>
+
+        <div class="empty">
+          Добавьте профиль аккаунта для авторизации.
+        </div>
+
+        <button class="primary" disabled>Синхронизировать Claude</button>
+      </div>
+
+      <!-- DEEPSEEK -->
+      <div class="card disabled deepseek">
+        <div class="card-header">
+          <h2>DeepSeek</h2>
+          <span class="badge">Нет аккаунтов</span>
+          <button class="small" onclick="addAccount('deepseek')">+ аккаунт</button>
+        </div>
+
+        <div class="empty" id="dsEmpty">
+          Добавьте профиль аккаунта для авторизации.
+        </div>
+
+        <!-- Account info (hidden until connected) -->
+        <div id="dsAccount" class="account hidden">
+          <div class="name">DeepSeek Chat</div>
+          <div class="status ok">подключен</div>
+          <div class="actions">
+            <button onclick="reconnect()">переподключить</button>
+          </div>
+        </div>
+
+        <button id="btnSyncAll" class="primary" disabled onclick="syncAllDeepSeek()">Синхронизировать DeepSeek</button>
+
+        <!-- URL list (hidden until connected) -->
+        <div id="deepseekUrls" class="url-area hidden">
+          <label for="dsUrls">URL чатов (по одному на строке):</label>
+          <textarea id="dsUrls" placeholder="https://chat.deepseek.com/a/chat/s/..."></textarea>
+        </div>
+
+        <button id="btnSyncSelected" class="primary" disabled onclick="syncSelected()">Синхронизировать выбранный чат</button>
+      </div>
+
+    </div>
+
+    <!-- JOURNAL -->
+    <div class="journal">
+      <div class="journal-header">
+        <h3>Журнал</h3>
+        <span id="bridgeStatus" class="status">bridge: ready</span>
+      </div>
+
+      <pre id="log"></pre>
+    </div>
+
+  </div>
+
+  <!-- SIDEBAR TOGGLE TAB -->
+  <div class="side-tab" onclick="toggleSidebar()">☰</div>
+
+  <!-- SIDEBAR OVERLAY -->
+  <div id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <h3>Debug</h3>
+      <button onclick="saveChatLog()">Save Chat Log</button>
+    </div>
+    <pre id="sidebarLog"></pre>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

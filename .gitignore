@@ -1,0 +1,8 @@
+.cookies/
+__pycache__/
+*.pyc
+raw/
+logs/
+inbox/
+SOURCE/
+.anchored_summary.md
