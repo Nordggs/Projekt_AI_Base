@@ -3,22 +3,29 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import threading
 import time as time_module
+import urllib.request
 from datetime import datetime
+from pathlib import Path
 
 import webview
 
 from core.logger import LogBuffer
 from exporters.base import Browser
 from exporters.deepseek import DeepSeekExporter
+from exporters.gemini_extract import (
+    extract_gemini_dom,
+    extract_gemini_rpc,
+    discover_gemini_sidebar_urls,
+)
 from exporters.playwright_browser import BrowserPlaywright
 from exporters.writer import ExportWriter
 
 
 MAX_LOGIN_SOFT = 600
 MAX_LOGIN_HARD = 1800
-MIN_EXPECTED_CHATS = 2
 
 
 class API:
@@ -39,6 +46,18 @@ class API:
         if self._app.pw:
             self._app.sync_provider(urls_json)
 
+    def add_gemini_account(self, url):
+        return self._app.add_gemini_account(url)
+
+    def sync_gemini(self, urls_json):
+        return self._app.sync_gemini(urls_json)
+
+    def reconnect_gemini(self):
+        return self._app.reconnect_gemini()
+
+    def launch_chrome(self):
+        return self._app.launch_chrome_cdp()
+
     def save_ui_snapshot(self, content):
         threading.Thread(
             target=self._app.save_ui_snapshot,
@@ -58,6 +77,14 @@ class API:
         with open(path, "w", encoding="utf-8") as f:
             f.write(trimmed)
         return path
+
+
+def _check_cdp_alive():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1) as r:
+            return "webSocketDebuggerUrl" in json.load(r)
+    except Exception:
+        return False
 
 
 class App:
@@ -91,6 +118,16 @@ class App:
 
         threading.Thread(target=self._pw_worker, daemon=True).start()
 
+        # Gemini worker (isolated single-owner)
+        self.gemini_pw = None
+        self.gemini_page = None
+        self._gemini_playwright = None
+        self._gw_queue = queue.Queue()
+        self._connect_gemini_done = threading.Event()
+        self._gemini_export_active = False
+        self._gemini_writer = None
+        threading.Thread(target=self._gw_worker, daemon=True).start()
+
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.ui_log_path = f"logs/ui_session_{self.session_id}.log"
         self.ui_snapshot_path = f"logs/ui_snapshot_{self.session_id}.log"
@@ -102,6 +139,8 @@ class App:
             self.log.add("[INFO] Saved cookies found, will auto-restore session...")
             t = threading.Thread(target=self._try_restore_session, daemon=True)
             t.start()
+
+
 
     # ── Login detection ──
 
@@ -164,6 +203,30 @@ class App:
 
             self._watch_url()
 
+    # ── Gemini worker (isolated single-owner) ──
+
+    def _gw_worker(self):
+        from playwright.sync_api import sync_playwright
+        self._gemini_playwright = sync_playwright().start()
+        while True:
+            try:
+                cmd, arg = self._gw_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            try:
+                if cmd == "connect_gemini":      self._do_connect_gemini(arg)
+                elif cmd == "export_gemini_batch":
+                    try:
+                        self._do_export_gemini_batch(arg)
+                    finally:
+                        self._gemini_export_active = False
+            except Exception as e:
+                self.log.add(f"[ERROR] _gw_worker cmd={cmd}: {e}")
+                self._push_log(f"Gemini ERR: {e}")
+                if cmd == "connect_gemini":
+                    self._connect_gemini_done.set()
+
     def _do_connect(self, url):
         self.log.add("[INFO] Connecting DeepSeek account...")
         self.log_ui_event("add_account start")
@@ -218,6 +281,56 @@ class App:
             self.pw.close()
             self.pw = None
         self._do_connect("https://chat.deepseek.com/")
+
+    # ── Gemini connection (isolated single-owner) ──
+
+    def _do_connect_gemini(self, arg):
+        self.log.add("[INFO] Connecting to Gemini via CDP...")
+        if not _check_cdp_alive():
+            self.log.add("[ERROR] Chrome CDP not running on 127.0.0.1:9222")
+            raise RuntimeError("CDP not available: Chrome not started with --remote-debugging-port=9222")
+
+        if self.gemini_pw:
+            try:
+                self.gemini_pw.close()
+            except Exception:
+                pass
+            self.gemini_pw = None
+            self.gemini_page = None
+
+        try:
+            browser = self._gemini_playwright.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            ctx = browser.contexts[0] if browser.contexts else None
+            if not ctx:
+                raise RuntimeError("No browser context found in CDP session")
+            page = ctx.new_page()
+            page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1000)
+
+            self.gemini_pw = browser
+            self.gemini_page = page
+            self._connect_gemini_done.set()
+            try:
+                self.window.evaluate_js("setGeminiConnected()")
+            except Exception:
+                pass
+            self.log.add("[INFO] Gemini connected via CDP")
+        except Exception as e:
+            self.log.add(f"[ERROR] CDP attach failed: {e}")
+            raise
+
+    def _ensure_gemini_page(self):
+        try:
+            if self.gemini_page:
+                self.gemini_page.evaluate("1")
+                return self.gemini_page
+        except Exception:
+            pass
+        if not self.gemini_pw or not self.gemini_pw.contexts:
+            raise RuntimeError("CDP disconnected")
+        ctx = self.gemini_pw.contexts[0]
+        self.gemini_page = ctx.new_page()
+        return self.gemini_page
 
     def _export_one(self, url):
         self.log.add(f"[INFO] Exporting {url[:60]}...")
@@ -283,12 +396,10 @@ class App:
                     pass
 
     def _do_export_batch(self, urls):
+        self.log.add(f"[DEEPSEEK] batch urls={len(urls)}")
+        urls = urls or self._discover_sidebar_urls()
         if not urls:
-            urls = self._discover_sidebar_urls()
-        if len(urls) < MIN_EXPECTED_CHATS:
-            urls = self._discover_all_chat_urls()
-        if not urls:
-            self.log.add("[ERROR] No chat URLs found in sidebar")
+            self.log.add("[ERROR] No DeepSeek chat URLs found")
             self._push_log("ERR: no URLs found")
             return
 
@@ -300,6 +411,81 @@ class App:
                 ok += 1
         self.log.add(f"[INFO] Batch done: {ok}/{len(urls)} OK")
         self._push_log(f"Batch done: {ok}/{len(urls)} OK")
+        try:
+            self.window.evaluate_js("copyLogContent()")
+        except Exception:
+            pass
+
+    # ── Gemini export (isolated single-owner) ──
+
+    def _goto_gemini(self, url):
+        try:
+            page = self._ensure_gemini_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return page
+        except Exception as e:
+            if "closed" in str(e).lower():
+                self.log.add("[WARN] Gemini page closed, recreating...")
+                page = self._ensure_gemini_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                return page
+            raise
+
+    def _export_gemini(self, url):
+        self.log.add(f"[INFO] Exporting Gemini {url[:60]}...")
+
+        try:
+            page = self._goto_gemini(url)
+            page.wait_for_timeout(1500)
+
+            data = extract_gemini_rpc(page, url)
+            if not data:
+                self.log.add("[INFO] RPC failed, using DOM extraction")
+                try:
+                    data = extract_gemini_dom(page, url)
+                except Exception as e:
+                    self.log.add(f"[GEMINI][EXTRACT][FATAL] {e}")
+                    return None
+
+            if not data:
+                self.log.add("[ERROR] Gemini extraction returned no data")
+                self._push_log("ERR: Gemini no data")
+                return None
+
+            path = self._gemini_writer.write(data)
+            n = len(data.get("messages", []))
+            self.log.add(f"[SUCCESS] Gemini {n} msgs → {path.name}")
+            self._push_log(f"Gemini OK: {n} msgs — {data.get('title', '?')}")
+            return {"ok": True, "path": str(path), "count": n}
+
+        except Exception as e:
+            self.log.add(f"[ERROR] Gemini export failed: {e}")
+            self._push_log(f"Gemini ERR: {e}")
+            return None
+
+    def _do_export_gemini_batch(self, urls):
+        self.log.add(f"[GEMINI] batch start user_urls={urls}")
+        urls = urls or discover_gemini_sidebar_urls(self.gemini_page)
+        if not urls:
+            self.log.add("[ERROR] No Gemini chat URLs found")
+            self._push_log("Gemini ERR: no URLs found")
+            return
+
+        self._gemini_export_active = True
+        self._gemini_writer = ExportWriter(out_dir=self._output_folders["gemini"])
+        Path(self._output_folders["gemini"]).mkdir(parents=True, exist_ok=True)
+        self.log.add(f"[GEMINI] writer exists = {self._gemini_writer is not None}")
+
+        results = []
+        for url in urls:
+            self.log.add(f"[GEMINI] calling export for {url[:60]}")
+            r = self._export_gemini(url)
+            if r:
+                results.append(r)
+
+        total = sum(r["count"] for r in results) if results else 0
+        self.log.add(f"[INFO] Gemini batch done: {total} msgs from {len(results)}/{len(urls)} chats")
+        self._push_log(f"Gemini batch: {total} msgs — {len(results)}/{len(urls)}")
         try:
             self.window.evaluate_js("copyLogContent()")
         except Exception:
@@ -440,6 +626,66 @@ class App:
         if self._connect_error:
             raise RuntimeError(self._connect_error)
         return "OK"
+
+    # ── Gemini public API ──
+
+    def add_gemini_account(self, url):
+        if self._auto_reconnecting:
+            return "BUSY"
+        self._connect_gemini_done.clear()
+        self._gw_queue.put(("connect_gemini", url))
+        if not self._connect_gemini_done.wait(timeout=30):
+            raise RuntimeError("Gemini CDP connection timeout")
+        if not self.gemini_pw:
+            raise RuntimeError("Gemini CDP connection failed")
+        return "OK"
+
+    def sync_gemini(self, urls_json):
+        if not self.gemini_pw:
+            self.log.add("[ERROR] Gemini not connected")
+            raise RuntimeError("Gemini not connected")
+        if self._gemini_export_active:
+            self.log.add("[WARN] Gemini export already in progress")
+            raise RuntimeError("Gemini export already in progress")
+        urls = json.loads(urls_json)
+        self.log.add(f"[INFO] Enqueuing Gemini batch export ({len(urls)} urls)")
+        self._gw_queue.put(("export_gemini_batch", urls))
+        return "STARTED"
+
+    def reconnect_gemini(self):
+        self.log.add("[INFO] Reconnecting Gemini...")
+        if self.gemini_pw:
+            try:
+                self.gemini_pw.close()
+            except Exception:
+                pass
+            self.gemini_pw = None
+            self.gemini_page = None
+        self.add_gemini_account("cdp")
+
+    def launch_chrome_cdp(self):
+        if _check_cdp_alive():
+            self.log.add("[INFO] CDP already active")
+            return "ALREADY_RUNNING"
+
+        chrome_dir = os.path.expanduser("~/.ai_pipeline/chrome_gemini")
+        os.makedirs(chrome_dir, exist_ok=True)
+
+        paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                self.log.add(f"[INFO] Launching Chrome from {p}")
+                subprocess.Popen([
+                    p, "--remote-debugging-port=9222",
+                    f"--user-data-dir={chrome_dir}",
+                ])
+                return "OK"
+
+        raise RuntimeError("Chrome not found in standard paths")
 
     # ── Session restore on startup ──
 

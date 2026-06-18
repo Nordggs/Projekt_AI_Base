@@ -10,13 +10,32 @@
   <!-- MODAL (hidden by default) -->
   <div id="modal" class="modal hidden">
     <div class="modal-content">
-      <h3>Подключить аккаунт</h3>
-      <label for="accountUrl">URL DeepSeek:</label>
+      <h3 id="modalTitle">Подключить аккаунт</h3>
+      <label id="modalLabel" for="accountUrl">URL сервиса:</label>
       <input id="accountUrl" placeholder="https://chat.deepseek.com/" />
       <div id="modalError" class="hidden" style="color:#f55;font-size:12px;margin-bottom:8px;"></div>
       <div class="modal-actions">
         <button class="primary" onclick="submitAccount()">Подключить</button>
         <button class="cancel" onclick="closeModal()">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CDP MODAL (hidden by default) -->
+  <div id="cdpModal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Подключение Gemini</h3>
+      <div class="cdp-steps">
+        <p>1. Запустите Chrome с CDP:</p>
+        <button class="primary" id="btnLaunchChrome" onclick="launchChromeCDP()">🚀 Запустить Chrome</button>
+        <p>2. Откройте <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> и войдите в аккаунт Google</p>
+      </div>
+      <div class="cdp-check-area">
+        <button class="primary" id="btnCdpCheck" onclick="checkGeminiCDP()">Проверить подключение</button>
+        <div id="cdpStatus" class="cdp-status"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="cancel" onclick="closeCdpModal()">Отмена</button>
       </div>
     </div>
   </div>
@@ -54,18 +73,34 @@
       </div>
 
       <!-- GEMINI -->
-      <div class="card disabled">
+      <div class="card gemini">
         <div class="card-header">
           <h2>Gemini</h2>
           <span class="badge">Нет аккаунтов</span>
           <button class="small" onclick="addAccount('gemini')">+ аккаунт</button>
         </div>
 
-        <div class="empty">
+        <div class="empty" id="gmEmpty">
           Добавьте профиль аккаунта для авторизации.
         </div>
 
-        <button class="primary" disabled>Синхронизировать Gemini</button>
+        <!-- Account info (hidden until connected) -->
+        <div id="gmAccount" class="account hidden">
+          <div class="name">Google Gemini</div>
+          <div class="status ok">подключен</div>
+          <div class="actions">
+            <button onclick="reconnectGemini()">переподключить</button>
+          </div>
+        </div>
+
+        <!-- URL list (hidden until connected) -->
+        <div id="geminiUrls" class="url-area hidden">
+          <label for="gmUrls">URL чатов (по одному на строке):</label>
+          <textarea id="gmUrls" placeholder="https://gemini.google.com/app/..."></textarea>
+        </div>
+
+        <button id="btnGeminiSyncAll" class="primary" disabled onclick="syncGeminiAll()">Синхронизировать Gemini</button>
+        <button id="btnGeminiSyncSelected" class="primary" disabled onclick="syncGeminiSelected()">Синхронизировать выбранный чат</button>
       </div>
 
       <!-- CLAUDE -->
@@ -127,7 +162,7 @@
       <pre id="log"></pre>
     </div>
 
-    <div class="version">v0.2.2</div>
+    <div class="version">v0.3.1</div>
 
   </div>
 

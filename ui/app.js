@@ -30,10 +30,17 @@ function setConnected() {
 }
 
 function addAccount(provider) {
+  if (provider === 'gemini') {
+    openCdpModal();
+    return;
+  }
   currentProvider = provider;
+  document.getElementById("modalTitle").textContent = "Подключить аккаунт";
+  document.getElementById("modalLabel").textContent = "URL DeepSeek:";
+  document.getElementById("accountUrl").value = "https://chat.deepseek.com/";
+  document.getElementById("accountUrl").placeholder = "https://chat.deepseek.com/";
   document.getElementById("modal").classList.remove("hidden");
   document.getElementById("modalError").classList.add("hidden");
-  document.getElementById("accountUrl").value = "https://chat.deepseek.com/";
 }
 
 function closeModal() {
@@ -67,6 +74,92 @@ function submitAccount() {
         btn.textContent = "Подключить";
         document.getElementById("modalError").textContent = "Ошибка: " + err;
         document.getElementById("modalError").classList.remove("hidden");
+      }
+    );
+  }
+}
+
+// ── CDP Modal for Gemini ──
+
+function openCdpModal() {
+  document.getElementById("cdpModal").classList.remove("hidden");
+  document.getElementById("cdpStatus").textContent = "";
+  document.getElementById("cdpStatus").className = "cdp-status";
+  document.getElementById("btnCdpCheck").disabled = false;
+  document.getElementById("btnCdpCheck").textContent = "Проверить подключение";
+}
+
+function closeCdpModal() {
+  document.getElementById("cdpModal").classList.add("hidden");
+}
+
+function checkGeminiCDP() {
+  const btn = document.getElementById("btnCdpCheck");
+  const status = document.getElementById("cdpStatus");
+  btn.disabled = true;
+  status.textContent = "⏳ Проверка CDP...";
+  status.className = "cdp-status waiting";
+
+  if (window.pywebview) {
+    window.pywebview.api.add_gemini_account('cdp').then(
+      function() {
+        status.textContent = "✅ Подключено";
+        status.className = "cdp-status ok";
+        btn.disabled = false;
+        setGeminiConnected();
+        setTimeout(closeCdpModal, 1500);
+      },
+      function(err) {
+        status.textContent = "❌ Ошибка: " + (err || "CDP не отвечает");
+        status.className = "cdp-status error";
+        btn.disabled = false;
+      }
+    );
+  }
+}
+
+function launchChromeCDP() {
+  const btn = document.getElementById("btnLaunchChrome");
+  const status = document.getElementById("cdpStatus");
+  btn.disabled = true;
+  btn.textContent = "Запуск...";
+  status.textContent = "⏳ Запуск Chrome...";
+  status.className = "cdp-status waiting";
+
+  if (window.pywebview) {
+    window.pywebview.api.launch_chrome().then(
+      function(resp) {
+        if (resp === "ALREADY_RUNNING") {
+          status.textContent = "✅ Chrome уже запущен с CDP";
+          status.className = "cdp-status ok";
+          setGeminiConnected();
+          setTimeout(closeCdpModal, 1500);
+          return;
+        }
+        status.textContent = "✅ Chrome запущен, ждём CDP...";
+        let tries = 0;
+        let delay = 800;
+        const timer = setInterval(function() {
+          tries++;
+          setTimeout(function() {
+            if (document.getElementById("cdpModal").classList.contains("hidden")) {
+              clearInterval(timer);
+              return;
+            }
+            checkGeminiCDP();
+            const s = document.getElementById("cdpStatus");
+            if (s.classList.contains("ok") || tries >= 10) {
+              clearInterval(timer);
+            }
+          }, Math.random() * 200);
+          delay = Math.min(delay * 1.2, 2000);
+        }, delay);
+      },
+      function(err) {
+        status.textContent = "❌ Ошибка: " + (err || "Chrome не найден");
+        status.className = "cdp-status error";
+        btn.disabled = false;
+        btn.textContent = "🚀 Запустить Chrome";
       }
     );
   }
@@ -171,6 +264,18 @@ function reconnect() {
 
 // ── Sidebar ──
 
+function copyLogContent() {
+  const text = document.getElementById("log").textContent;
+  navigator.clipboard.writeText(text).catch(function() {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+  });
+}
+
 function toggleSidebar() {
   document.getElementById("sidebar").classList.toggle("open");
 }
@@ -215,4 +320,90 @@ function setWaiting(seconds) {
   const badge = document.querySelector(".deepseek .badge");
   badge.textContent = "ожидание " + seconds + "s";
   badge.className = "badge waiting";
+}
+
+// ── Gemini ──
+
+function setGeminiConnected() {
+  document.querySelector(".gemini .badge").textContent = "1 подключено";
+  document.querySelector(".gemini .badge").className = "badge ok";
+  document.getElementById("gmEmpty").style.display = "none";
+  document.getElementById("gmAccount").classList.remove("hidden");
+  document.getElementById("geminiUrls").classList.remove("hidden");
+  document.getElementById("btnGeminiSyncAll").disabled = false;
+  document.getElementById("btnGeminiSyncSelected").disabled = false;
+  setBridgeStatus("gemini connected");
+}
+
+function getActiveGeminiUrl() {
+  const textarea = document.getElementById("gmUrls");
+  const start = textarea.selectionStart;
+  const lines = textarea.value.split("\n");
+  let pos = 0;
+  for (let i = 0; i < lines.length; i++) {
+    pos += lines[i].length + 1;
+    if (start <= pos) {
+      const url = lines[i].trim();
+      if (url) return url;
+      break;
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const url = lines[i].trim();
+    if (url) return url;
+  }
+  return "";
+}
+
+function _runGeminiSync(urls, btn) {
+  btn.disabled = true;
+  btn.textContent = "Exporting...";
+  if (window.pywebview) {
+    window.pywebview.api.sync_gemini(JSON.stringify(urls))
+      .then(function(resp) {
+        btn.disabled = false;
+        btn.textContent = btn.id === "btnGeminiSyncAll"
+          ? "Синхронизировать Gemini"
+          : "Синхронизировать выбранный чат";
+        if (resp && resp.ok) {
+          log("[GEMINI] exported: " + resp.count + " msgs → " + resp.path);
+        } else {
+          log("[GEMINI] export queued");
+        }
+        setBridgeStatus("ready");
+      })
+      .catch(function(err) {
+        btn.disabled = false;
+        btn.textContent = btn.id === "btnGeminiSyncAll"
+          ? "Синхронизировать Gemini"
+          : "Синхронизировать выбранный чат";
+        log("[GEMINI ERROR] " + (err.message || err));
+      });
+  }
+}
+
+function syncGeminiAll() {
+  const el = document.getElementById("gmUrls");
+  const urls = el.value.split("\n").map(function(s) { return s.trim(); }).filter(Boolean);
+  if (urls.length === 0) {
+    log("Gemini sync all: auto-discovering URLs from sidebar...");
+  } else {
+    log("Gemini sync all: " + urls.length + " urls");
+  }
+  _runGeminiSync(urls, document.getElementById("btnGeminiSyncAll"));
+}
+
+function syncGeminiSelected() {
+  const url = getActiveGeminiUrl();
+  if (!url) {
+    log("no Gemini URL selected");
+    return;
+  }
+  log("Gemini sync selected: " + url.slice(0, 50) + "...");
+  _runGeminiSync([url], document.getElementById("btnGeminiSyncSelected"));
+}
+
+function reconnectGemini() {
+  log("reconnect Gemini");
+  openCdpModal();
 }

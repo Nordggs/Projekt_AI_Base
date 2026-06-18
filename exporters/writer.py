@@ -19,7 +19,7 @@ class ExportWriter:
         date = datetime.now().strftime("%Y-%m-%d")
         h = self._hash(data)
         sub_dir = self.out_dir / service
-        sub_dir.mkdir(exist_ok=True)
+        sub_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{title}_{service}_{date}_{h}.md"
         path = sub_dir / filename
         md = self._to_markdown(data)

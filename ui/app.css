@@ -408,3 +408,59 @@ pre {
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* CDP MODAL */
+.cdp-steps {
+  margin: 10px 0;
+}
+
+.cdp-steps p {
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+
+.cdp-steps code {
+  display: block;
+  background: #0b0f17;
+  border: 1px solid #2a3345;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #b0b8c4;
+  word-break: break-all;
+  margin: 4px 0 10px;
+}
+
+.cdp-steps a {
+  color: #2f6bff;
+}
+
+.cdp-steps .primary {
+  margin: 6px 0 12px;
+}
+
+.cdp-check-area {
+  margin: 14px 0;
+}
+
+.cdp-check-area .primary {
+  margin-top: 0;
+}
+
+.cdp-status {
+  margin-top: 8px;
+  font-size: 13px;
+  min-height: 20px;
+}
+
+.cdp-status.ok {
+  color: #0ea56a;
+}
+
+.cdp-status.error {
+  color: #f55;
+}
+
+.cdp-status.waiting {
+  color: #f0b400;
+}
