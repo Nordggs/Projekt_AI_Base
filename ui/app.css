@@ -50,7 +50,7 @@ body {
 /* GRID */
 .grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 12px;
 }
 
@@ -407,6 +407,27 @@ pre {
   margin-top: 8px;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* SPLASH SCREEN */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #0b0f17;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.6s ease;
+}
+#splash.fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+#splash img {
+  max-width: 80%;
+  max-height: 80%;
+  object-fit: contain;
 }
 
 .danger {

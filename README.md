@@ -1,6 +1,8 @@
-# AI Chat Saver
+# AI Chat Exporter
 
-Десктопное приложение для экспорта диалогов AI (Gemini, DeepSeek) в локальные Markdown-файлы.  
+![AI Chat Exporter](ui/splash.png)
+
+Десктопное приложение для экспорта диалогов AI (Gemini, DeepSeek, Qwen) в локальные Markdown-файлы.  
 Без API-ключей, без облачных сервисов, без HTTP-сервера.
 
 ## Быстрый старт
@@ -27,6 +29,13 @@ python main.py
 5. Вставьте URL чата Gemini, нажмите **Sync**
 6. Файл сохраняется в `raw/gemini/`
 
+### Qwen
+1. Подключите Gemini (Chrome + CDP) — Qwen использует тот же Chrome
+2. На карточке Qwen нажмите **+ аккаунт** — откроется вкладка `chat.qwen.ai`
+3. Войдите в Qwen (однократно, сессия сохраняется)
+4. Нажмите **Синхронизировать Qwen**
+5. Файл сохраняется в `raw/qwen/`
+
 ## Формат выходного файла
 
 ```
@@ -39,7 +48,7 @@ python main.py
 
 Имя файла: `{title}_{service}_{date}_{hash10}.md`
 
-## Экстракция Gemini (v0.3.1)
+## Экстракция Gemini (v0.4.0)
 
 Два уровня:
 1. **RPC** — `/_/Batchexecute` (быстрый, не всегда доступен)
@@ -56,14 +65,18 @@ python main.py
 │   ├── playwright_browser.py    # Управление Playwright Chromium
 │   ├── deepseek.py              # DeepSeekExporter (scroll engine v2)
 │   ├── gemini_extract.py        # GEMINI_EXTRACT_JS, RPC + DOM fallback
+│   ├── qwen_extract.py          # Qwen DOM extraction + scroll-loop
 │   └── writer.py                # ExportWriter (raw/*.md)
 ├── core/
 │   └── logger.py                # LogBuffer (thread-safe)
 ├── ui/
 │   ├── app.html                 # UI layout
 │   ├── app.js                   # UI logic + pywebview bridge
-│   └── app.css                  # Styles
+│   ├── app.css                  # Styles + splash
+│   ├── icon.png                 # Window icon / favicon
+│   └── splash.png               # Splash screen
 ├── raw/                         # Выходные .md файлы
+├── CHANGELOG.md
 ├── requirements.txt
 └── ARCHITECTURE.md              # Полная документация архитектуры
 ```

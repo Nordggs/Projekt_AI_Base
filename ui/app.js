@@ -13,6 +13,17 @@ function log(msg) {
 
 function setBridgeStatus(status) {
   document.getElementById("bridgeStatus").textContent = status;
+  if (status === "ready" || status === "connected") {
+    fadeSplash();
+  }
+}
+
+function fadeSplash() {
+  const s = document.getElementById("splash");
+  if (s && !s.classList.contains("fade-out")) {
+    s.classList.add("fade-out");
+    setTimeout(function() { s.style.display = "none"; }, 600);
+  }
 }
 
 // ── Modal ──
@@ -204,6 +215,7 @@ function launchChromeCDP() {
 
 let exportStateDS = "idle"; // idle | running | cancelling
 let exportStateGM = "idle";
+let exportStateQW = "idle";
 
 function cancelDeepSeek() {
   if (exportStateDS !== "running") return;
@@ -248,6 +260,28 @@ function showStopButtonGM() {
 function hideStopButtonGM() {
   exportStateGM = "idle";
   document.getElementById("btnStopGM").classList.add("hidden");
+}
+
+function cancelQwen() {
+  if (exportStateQW !== "running") return;
+  exportStateQW = "cancelling";
+  document.getElementById("btnStopQW").disabled = true;
+  document.getElementById("btnStopQW").textContent = "⏹ Останавливаю...";
+  Promise.resolve(
+    window.pywebview?.api?.cancel_qwen_export?.()
+  ).finally(() => {
+    log("Qwen cancel requested");
+    hideStopButtonQW();
+  });
+}
+function showStopButtonQW() {
+  exportStateQW = "running";
+  const btn = document.getElementById("btnStopQW");
+  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
+}
+function hideStopButtonQW() {
+  exportStateQW = "idle";
+  document.getElementById("btnStopQW").classList.add("hidden");
 }
 
 // ── Sync ──
@@ -493,3 +527,105 @@ function reconnectGemini() {
   log("reconnect Gemini");
   openCdpModal();
 }
+
+// ── Qwen ──
+
+function addQwenAccount() {
+  log("connecting Qwen...");
+  if (window.pywebview) {
+    window.pywebview.api.connect_qwen().then(
+      function() {
+        log("Qwen connected");
+        setQwenConnected();
+      },
+      function(err) {
+        log("Qwen connect failed: " + err);
+      }
+    );
+  }
+}
+
+function setQwenConnected() {
+  document.querySelector(".qwen .badge").textContent = "1 подключено";
+  document.querySelector(".qwen .badge").className = "badge ok";
+  document.getElementById("qwEmpty").style.display = "none";
+  document.getElementById("qwAccount").classList.remove("hidden");
+  document.getElementById("qwenUrls").classList.remove("hidden");
+  document.getElementById("btnQwenSyncAll").disabled = false;
+  document.getElementById("btnQwenSyncSelected").disabled = false;
+  setBridgeStatus("qwen connected");
+}
+
+function getActiveQwenUrl() {
+  const textarea = document.getElementById("qwUrls");
+  const start = textarea.selectionStart;
+  const lines = textarea.value.split("\n");
+  let pos = 0;
+  for (let i = 0; i < lines.length; i++) {
+    pos += lines[i].length + 1;
+    if (start <= pos) {
+      const url = lines[i].trim();
+      if (url) return url;
+      break;
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const url = lines[i].trim();
+    if (url) return url;
+  }
+  return "";
+}
+
+function _runQwenSync(urls, btn) {
+  btn.disabled = true;
+  btn.textContent = "Exporting...";
+  showStopButtonQW();
+  if (window.pywebview) {
+    window.pywebview.api.sync_qwen(JSON.stringify(urls))
+      .then(function(resp) {
+        hideStopButtonQW();
+        btn.disabled = false;
+        btn.textContent = btn.id === "btnQwenSyncAll"
+          ? "Синхронизировать Qwen"
+          : "Синхронизировать выбранный чат";
+        if (resp && resp.ok) {
+          log("[QWEN] exported: " + resp.count + " msgs → " + resp.path);
+        } else {
+          log("[QWEN] export queued");
+        }
+        setBridgeStatus("ready");
+      })
+      .catch(function(err) {
+        hideStopButtonQW();
+        btn.disabled = false;
+        btn.textContent = btn.id === "btnQwenSyncAll"
+          ? "Синхронизировать Qwen"
+          : "Синхронизировать выбранный чат";
+        log("[QWEN ERROR] " + (err.message || err));
+      });
+  }
+}
+
+function syncQwenAll() {
+  log("Qwen sync all: auto-discovering URLs from sidebar...");
+  _runQwenSync([], document.getElementById("btnQwenSyncAll"));
+}
+
+function syncQwenSelected() {
+  const url = getActiveQwenUrl();
+  if (!url) {
+    log("no Qwen URL selected");
+    return;
+  }
+  log("Qwen sync selected: " + url.slice(0, 50) + "...");
+  _runQwenSync([url], document.getElementById("btnQwenSyncSelected"));
+}
+
+function reconnectQwen() {
+  log("reconnect Qwen");
+  addQwenAccount();
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  setTimeout(fadeSplash, 2500);
+});

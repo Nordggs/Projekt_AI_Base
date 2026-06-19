@@ -2,10 +2,16 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>AI Chat Saver</title>
+  <title>AI Chat Exporter</title>
   <link rel="stylesheet" href="app.css" />
+  <link rel="icon" href="icon.png" />
 </head>
 <body>
+
+  <!-- SPLASH SCREEN -->
+  <div id="splash">
+    <img src="splash.png" alt="AI Chat Exporter" />
+  </div>
 
   <!-- MODAL (hidden by default) -->
   <div id="modal" class="modal hidden">
@@ -45,7 +51,7 @@
     <!-- TOP BAR -->
     <div class="topbar">
       <div class="title">
-        AI Chat Saver
+        AI Chat Exporter
         <span class="subtitle">LOCAL MARKDOWN EXPORTER</span>
       </div>
 
@@ -120,6 +126,39 @@
         <button class="primary" disabled>Синхронизировать Claude</button>
       </div>
 
+      <!-- QWEN -->
+      <div class="card qwen">
+        <div class="card-header">
+          <h2>Qwen</h2>
+          <span class="badge">Нет аккаунтов</span>
+          <button class="small" onclick="addQwenAccount()">+ аккаунт</button>
+        </div>
+
+        <div class="empty" id="qwEmpty">
+          Подключите аккаунт Qwen для авторизации.
+        </div>
+
+        <!-- Account info (hidden until connected) -->
+        <div id="qwAccount" class="account hidden">
+          <div class="name">Qwen Chat</div>
+          <div class="status ok">подключен</div>
+          <div class="actions">
+            <button onclick="reconnectQwen()">переподключить</button>
+          </div>
+        </div>
+
+        <button id="btnQwenSyncAll" class="primary" disabled onclick="syncQwenAll()">Синхронизировать Qwen</button>
+        <button id="btnStopQW" class="danger hidden" onclick="cancelQwen()">⏹ Остановить</button>
+
+        <!-- URL list (hidden until connected) -->
+        <div id="qwenUrls" class="url-area hidden">
+          <label for="qwUrls">URL чатов (по одному на строке):</label>
+          <textarea id="qwUrls" placeholder="https://chat.qwen.ai/c/..."></textarea>
+        </div>
+
+        <button id="btnQwenSyncSelected" class="primary" disabled onclick="syncQwenSelected()">Синхронизировать выбранный чат</button>
+      </div>
+
       <!-- DEEPSEEK -->
       <div class="card disabled deepseek">
         <div class="card-header">
@@ -165,7 +204,7 @@
       <pre id="log"></pre>
     </div>
 
-    <div class="version">v0.3.1</div>
+    <div class="version">v0.4.0</div>
 
   </div>
 

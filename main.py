@@ -20,6 +20,10 @@ from exporters.gemini_extract import (
     extract_gemini_rpc,
     discover_gemini_sidebar_urls,
 )
+from exporters.qwen_extract import (
+    extract_qwen_dom,
+    discover_qwen_sidebar_urls,
+)
 from exporters.playwright_browser import BrowserPlaywright
 from exporters.writer import ExportWriter
 
@@ -98,6 +102,20 @@ class API:
         a.log.add("[INFO] Gemini export cancelled by user")
         return a.save_log()
 
+    def connect_qwen(self):
+        return self._app.add_qwen_account()
+
+    def sync_qwen(self, urls_json):
+        return self._app.sync_qwen(urls_json)
+
+    def cancel_qwen_export(self):
+        a = self._app
+        a._cancel_requested_qwen = True
+        a._cancel_epoch_qwen = time_module.time()
+        a._export_session_qwen += 1
+        a.log.add("[INFO] Qwen export cancelled by user")
+        return a.save_log()
+
     def save_ui_snapshot(self, content):
         threading.Thread(
             target=self._app.save_ui_snapshot,
@@ -131,11 +149,12 @@ class App:
     def __init__(self):
         self.api = API(self)
         self.window = webview.create_window(
-            "AI Chat Saver",
+            "AI Chat Exporter",
             url="ui/app.html",
             js_api=self.api,
             width=1300,
             height=750,
+            icon='ui/icon.png',
         )
         self.log = LogBuffer()
         self.writer = ExportWriter()
@@ -160,6 +179,7 @@ class App:
             "chatgpt": "raw",
             "gemini": "raw",
             "claude": "raw",
+            "qwen": "raw",
         }
 
         threading.Thread(target=self._pw_worker, daemon=True).start()
@@ -175,6 +195,22 @@ class App:
         self._gemini_connect_lock = False
         self._gemini_connect_state = "idle"  # idle | connecting | connected
         self._gemini_last_fail_time = 0
+        self._cdp_lock = threading.Lock()
+
+        # Qwen (CDP page in same browser as Gemini)
+        self.qwen_page = None
+        self._qwen_connected = False
+        self._qwen_connect_lock = False
+        self._connect_qwen_done = threading.Event()
+        self._cancel_requested_qwen = False
+        self._cancel_epoch_qwen = 0
+        self._export_session_qwen = 0
+        self._qwen_export_active = False
+        self._qwen_writer = None
+        self._qwen_fail_count = 0
+        self._qwen_last_fail_time = 0
+        self._qwen_page_state = "ok"  # ok | unstable | dead
+
         threading.Thread(target=self._gw_worker, daemon=True).start()
 
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -270,11 +306,22 @@ class App:
                         self._do_export_gemini_batch(arg)
                     finally:
                         self._gemini_export_active = False
+                elif cmd == "connect_qwen":
+                    with self._cdp_lock:
+                        self._do_connect_qwen()
+                    self._connect_qwen_done.set()
+                elif cmd == "export_qwen_batch":
+                    try:
+                        self._do_export_qwen_batch(arg)
+                    finally:
+                        self._qwen_export_active = False
             except Exception as e:
                 self.log.add(f"[ERROR] _gw_worker cmd={cmd}: {e}")
                 self._push_log(f"Gemini ERR: {e}")
                 if cmd == "connect_gemini":
                     self._connect_gemini_done.set()
+                elif cmd == "connect_qwen":
+                    self._connect_qwen_done.set()
 
     def _do_connect(self, url):
         self.log.add("[INFO] Connecting DeepSeek account...")
@@ -613,6 +660,246 @@ class App:
             self._gemini_export_active = False
             self._cancel_requested_gemini = False
             self._cancel_epoch_gemini = 0
+
+    # ── Qwen (CDP page in same browser as Gemini) ──
+
+    def _do_connect_qwen(self):
+        self.log.add("[INFO] Connecting to Qwen via CDP...")
+        if not self.gemini_pw:
+            raise RuntimeError("Gemini not connected — start Chrome first")
+        if not _check_cdp_alive():
+            raise RuntimeError("CDP not available")
+
+        if self._reattach_qwen_page():
+            return
+
+        if self.qwen_page:
+            try:
+                self.qwen_page.close()
+            except Exception:
+                pass
+            self.qwen_page = None
+
+        try:
+            ctx = self.gemini_pw.contexts[0]
+            page = ctx.new_page()
+            page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1000)
+
+            self.qwen_page = page
+            self._qwen_connected = True
+            try:
+                self.window.evaluate_js("setQwenConnected()")
+            except Exception:
+                pass
+            self.log.add("[INFO] Qwen connected via CDP")
+        except Exception as e:
+            self._qwen_connected = False
+            self.qwen_page = None
+            self.log.add(f"[ERROR] Qwen CDP attach failed: {e}")
+            raise
+
+    def classify_qwen_failure(self, e):
+        s = str(e).lower()
+        if "target closed" in s:
+            return "target_closed"
+        if "execution context" in s:
+            return "context_destroyed"
+        if "navigation" in s:
+            return "navigation"
+        return "unknown"
+
+    def ensure_qwen_alive(self):
+        if not self.qwen_page:
+            self._qwen_connected = False
+            self._qwen_page_state = "dead"
+            return False
+        try:
+            self.qwen_page.evaluate("1")
+            self._qwen_fail_count = 0
+            self._qwen_page_state = "ok"
+            return True
+        except Exception as e:
+            reason = self.classify_qwen_failure(e)
+            url = getattr(self.qwen_page, "url", "?")
+            cdp_alive = _check_cdp_alive()
+            self._push_log(f"[QWEN][HEALTHCHECK] {reason} | url={url} | cdp={cdp_alive} | exc={repr(e)}")
+
+            if reason == "target_closed":
+                self.qwen_page = None
+                self._qwen_connected = False
+                self._qwen_page_state = "dead"
+                self._push_log("Qwen page lost — reconnect required")
+                return False
+
+            self._qwen_page_state = "unstable"
+            self._qwen_fail_count += 1
+            self._qwen_last_fail_time = time.time()
+
+            if self._qwen_fail_count >= 3:
+                self._push_log(f"[QWEN] {self._qwen_fail_count} failures, reloading page...")
+                try:
+                    self.qwen_page.reload(wait_until="domcontentloaded", timeout=30000)
+                    self.qwen_page.wait_for_timeout(2000)
+                    self._qwen_fail_count = 0
+                    self._qwen_page_state = "ok"
+                    return True
+                except Exception as reload_e:
+                    self._push_log(f"[QWEN] reload failed: {reload_e}")
+                    self.qwen_page = None
+                    self._qwen_connected = False
+                    self._qwen_page_state = "dead"
+                    return False
+
+            return False
+
+    def _reattach_qwen_page(self):
+        try:
+            ctx = self.gemini_pw.contexts[0]
+            for p in ctx.pages:
+                url = p.url or ""
+                if "chat.qwen.ai" in url and "/login" not in url:
+                    self.qwen_page = p
+                    self._qwen_connected = True
+                    self._qwen_fail_count = 0
+                    self._qwen_page_state = "ok"
+                    self._push_log(f"[QWEN] reattached to page: {url[:60]}")
+                    return True
+        except Exception as e:
+            self._push_log(f"[QWEN] reattach failed: {e}")
+        return False
+
+    def _export_qwen(self, url):
+        self.log.add(f"[INFO] Exporting Qwen {url[:60]}...")
+        if self._cancel_requested_qwen:
+            self.log.add("[INFO] Qwen export cancelled mid-chat")
+            return None
+        if not self.ensure_qwen_alive():
+            return None
+
+        try:
+            with self._cdp_lock:
+                self.qwen_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                self.qwen_page.wait_for_timeout(2000)
+
+            data = extract_qwen_dom(self.qwen_page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_requested_qwen, cancel_epoch=self._cancel_epoch_qwen)
+
+            if not data:
+                self.log.add("[ERROR] Qwen extraction returned no data")
+                self._push_log("ERR: Qwen no data")
+                return None
+
+            if not data.get("messages"):
+                self.log.add("[ERROR] Qwen extraction returned 0 messages, skipping write")
+                self._push_log("Qwen ERR: 0 messages")
+                return None
+
+            path = self._qwen_writer.write(data)
+            if not path:
+                self._push_log("Qwen ERR: write failed")
+                return None
+
+            n = len(data.get("messages", []))
+            self.log.add(f"[SUCCESS] Qwen {n} msgs → {path.name}")
+            self._push_log(f"Qwen OK: {n} msgs — {data.get('title', '?')}")
+            return {"ok": True, "path": str(path), "count": n}
+
+        except Exception as e:
+            self.log.add(f"[ERROR] Qwen export failed: {e}")
+            self._push_log(f"Qwen ERR: {e}")
+            return None
+
+    def add_qwen_account(self):
+        if self._qwen_connect_lock:
+            return "BUSY"
+        if self._qwen_connected:
+            return "OK"
+        self._qwen_connect_lock = True
+        try:
+            self._connect_qwen_done.clear()
+            self._gw_queue.put(("connect_qwen", ""))
+            if not self._connect_qwen_done.wait(timeout=30):
+                raise RuntimeError("Qwen CDP connection timeout")
+            if not self._qwen_connected:
+                raise RuntimeError("Qwen CDP connection failed")
+            return "OK"
+        finally:
+            self._qwen_connect_lock = False
+
+    def sync_qwen(self, urls_json):
+        if not self._qwen_connected:
+            raise RuntimeError("Qwen not connected")
+        if not self.ensure_qwen_alive():
+            raise RuntimeError("Qwen page lost — reconnect required")
+        if self._qwen_export_active:
+            raise RuntimeError("Qwen export already in progress")
+        urls = json.loads(urls_json)
+        self.log.add(f"[INFO] Enqueuing Qwen batch export ({len(urls)} urls)")
+        self._gw_queue.put(("export_qwen_batch", urls))
+        return "STARTED"
+
+    def reconnect_qwen(self):
+        self.log.add("[INFO] Reconnecting Qwen...")
+        if self.qwen_page:
+            try:
+                self.qwen_page.close()
+            except Exception:
+                pass
+            self.qwen_page = None
+        self._qwen_connected = False
+        self.add_qwen_account()
+
+    def _do_export_qwen_batch(self, urls):
+        self.log.add(f"[QWEN] batch start user_urls={urls}")
+        urls = urls or discover_qwen_sidebar_urls(self.qwen_page)
+        if not urls:
+            self.log.add("[ERROR] No Qwen chat URLs found")
+            self._push_log("Qwen ERR: no URLs found")
+            return
+
+        self._qwen_export_active = True
+        self._qwen_writer = ExportWriter(out_dir=self._output_folders["qwen"])
+        run_session = self._export_session_qwen
+
+        try:
+            try:
+                ctx = self.gemini_pw.contexts[0]
+                pages_info = [(p.url or "?", "") for p in ctx.pages]
+                self._push_log(f"[QWEN][CDP TARGETS] {pages_info}")
+            except Exception:
+                pass
+
+            results = []
+            for idx, url in enumerate(urls, 1):
+                if self._cancel_requested_qwen:
+                    if run_session != self._export_session_qwen:
+                        break
+                    self.log.add("[INFO] Qwen export cancelled by user")
+                    self._push_log("⏹ Qwen export cancelled")
+                    break
+                if not self.ensure_qwen_alive():
+                    self.log.add("[WARN] Qwen page dead, stopping batch")
+                    self._push_log("Qwen ERR: page lost")
+                    break
+                self.log.add(f"[QWEN] [{idx}/{len(urls)}] exporting {url[:40]}")
+                self._push_log(f"Qwen [{idx}/{len(urls)}]...")
+                r = self._export_qwen(url)
+                if r:
+                    results.append(r)
+                else:
+                    self.log.add(f"[QWEN] export returned None for {url[:60]}")
+
+            total = sum(r["count"] for r in results) if results else 0
+            self.log.add(f"[INFO] Qwen batch done: {total} msgs from {len(results)}/{len(urls)} chats")
+            self._push_log(f"Qwen batch: {total} msgs — {len(results)}/{len(urls)}")
+            try:
+                self.window.evaluate_js("copyLogContent()")
+            except Exception:
+                pass
+        finally:
+            self._qwen_export_active = False
+            self._cancel_requested_qwen = False
+            self._cancel_epoch_qwen = 0
 
     # ── URL watcher (runs in _pw_worker idle loop) ──
 
