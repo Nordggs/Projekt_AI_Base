@@ -1,15 +1,27 @@
 import json
+import time
 
 GEMINI_EXTRACT_JS = """
 () => {
     const messages = [];
-    document.querySelectorAll("user-query, model-response").forEach(el => {
-        const text = el.innerText?.trim();
+    document.querySelectorAll("message-content, model-response, user-query").forEach(el => {
+        let text;
+        try {
+            text = el.innerText?.trim();
+        } catch(e) {
+            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+            const parts = [];
+            while (walker.nextNode()) {
+                const v = walker.currentNode.textContent.trim();
+                if (v) parts.push(v);
+            }
+            text = parts.join('\\n');
+        }
         if (!text) return;
-        messages.push({
-            role: el.tagName === "USER-QUERY" ? "user" : "assistant",
-            content: text
-        });
+        const role = el.tagName === "USER-QUERY" ? "user"
+                  : el.tagName === "MESSAGE-CONTENT" ? "assistant"
+                  : "assistant";
+        messages.push({ role, content: text });
     });
     const title = (document.title || '').replace(/\\s*[–-]\\s*Gemini.*/i, '').trim() || 'Gemini Chat';
     const chatId = (location.pathname.match(/\\/app\\/([^\\/?#]+)/) || [])[1] || '';
@@ -24,16 +36,19 @@ GEMINI_EXTRACT_JS = """
 
 SCROLL_BOTTOM_JS = """
 () => {
-    const el = document.scrollingElement
+    const el = document.querySelector('cdk-virtual-scroll-viewport')
         || document.querySelector('main')
-        || document.body;
+        || document.scrollingElement;
     if (!el) return false;
-    el.scrollTop = el.scrollHeight;
-    return el.scrollTop;
+    el.scrollBy(0, 1500);
+    el.dispatchEvent(new Event('scroll'));
+    window.dispatchEvent(new Event('scroll'));
+    window.dispatchEvent(new Event('resize'));
+    return true;
 }
 """
 
-def extract_gemini_dom(page, url) -> dict | None:
+def extract_gemini_dom(page, url, log_progress=None, cancel_check=None, cancel_epoch=0) -> dict | None:
     page.wait_for_timeout(1500)
 
     merged, seen = [], set()
@@ -46,6 +61,12 @@ def extract_gemini_dom(page, url) -> dict | None:
     MAX_ITER = 50
 
     for i in range(MAX_ITER):
+        if cancel_check and cancel_check():
+            if cancel_epoch and (time.time() - cancel_epoch) < 0.3:
+                pass  # flicker guard
+            else:
+                break
+
         data = page.evaluate(GEMINI_EXTRACT_JS)
         new_count = 0
 
@@ -84,6 +105,9 @@ def extract_gemini_dom(page, url) -> dict | None:
             break
         if no_new_rounds >= MAX_NO_NEW and i > 10:
             break
+
+        if i % 10 == 0 and i > 0 and log_progress:
+            log_progress(f"scroll {i}/{MAX_ITER}: {len(merged)} msgs")
 
         page.evaluate(SCROLL_BOTTOM_JS)
         page.wait_for_timeout(1200)
@@ -148,7 +172,7 @@ def _parse_rpc_response(text: str, chat_id: str, url: str) -> dict | None:
         data = json.loads(text[start:end])
         turns = data[0] if isinstance(data[0], list) else data
         messages = []
-        for turn in turns:
+        for idx, turn in enumerate(turns):
             if not isinstance(turn, list) or len(turn) < 4:
                 continue
             turn_data = turn[4] if len(turn) > 4 and isinstance(turn[4], list) else turn
@@ -156,11 +180,10 @@ def _parse_rpc_response(text: str, chat_id: str, url: str) -> dict | None:
                 content = turn_data[0]
             else:
                 content = str(turn_data) if turn_data else ''
-            role = 'assistant'
             if isinstance(content, str) and len(content) < 200:
                 if not content.strip():
                     continue
-            messages.append({'role': 'user' if i % 2 == 0 else 'assistant', 'content': str(content)})
+            messages.append({'role': 'user' if idx % 2 == 0 else 'assistant', 'content': str(content)})
 
         if not messages:
             return None

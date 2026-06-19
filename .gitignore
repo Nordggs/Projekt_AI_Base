@@ -1,8 +1,22 @@
-.cookies/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# Browser session data
+.cookies/
+
+# Export results
 raw/
+
+# Logs
 logs/
+
+# Release backups
+release/
+
+# Internal analysis
+analysis/
 inbox/
 SOURCE/
-.anchored_summary.md

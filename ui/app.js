@@ -94,31 +94,40 @@ function closeCdpModal() {
 }
 
 function checkGeminiCDP() {
-  const btn = document.getElementById("btnCdpCheck");
   const status = document.getElementById("cdpStatus");
-  btn.disabled = true;
   status.textContent = "⏳ Проверка CDP...";
   status.className = "cdp-status waiting";
 
   if (window.pywebview) {
-    window.pywebview.api.add_gemini_account('cdp').then(
-      function() {
-        status.textContent = "✅ Подключено";
-        status.className = "cdp-status ok";
-        btn.disabled = false;
-        setGeminiConnected();
-        setTimeout(closeCdpModal, 1500);
+    window.pywebview.api.check_cdp_status().then(
+      function(state) {
+        if (state === "connected") {
+          status.textContent = "✅ Подключено";
+          status.className = "cdp-status ok";
+          setGeminiConnected();
+          setTimeout(closeCdpModal, 1500);
+        } else if (state === "connecting") {
+          status.textContent = "⏳ Подключаюсь к Gemini...";
+          status.className = "cdp-status waiting";
+        } else if (state === "cdp_ready") {
+          status.textContent = "⏳ Подключаюсь к Gemini...";
+          status.className = "cdp-status waiting";
+          window.pywebview.api.start_gemini_connect();
+        } else {
+          status.textContent = "⏳ Chrome ещё не готов...";
+          status.className = "cdp-status waiting";
+        }
       },
       function(err) {
         status.textContent = "❌ Ошибка: " + (err || "CDP не отвечает");
         status.className = "cdp-status error";
-        btn.disabled = false;
       }
     );
   }
 }
 
 function launchChromeCDP() {
+  window._connect_triggered = false;
   const btn = document.getElementById("btnLaunchChrome");
   const status = document.getElementById("cdpStatus");
   btn.disabled = true;
@@ -129,13 +138,6 @@ function launchChromeCDP() {
   if (window.pywebview) {
     window.pywebview.api.launch_chrome().then(
       function(resp) {
-        if (resp === "ALREADY_RUNNING") {
-          status.textContent = "✅ Chrome уже запущен с CDP";
-          status.className = "cdp-status ok";
-          setGeminiConnected();
-          setTimeout(closeCdpModal, 1500);
-          return;
-        }
         status.textContent = "✅ Chrome запущен, ждём CDP...";
         let tries = 0;
         let delay = 800;
@@ -146,11 +148,44 @@ function launchChromeCDP() {
               clearInterval(timer);
               return;
             }
-            checkGeminiCDP();
-            const s = document.getElementById("cdpStatus");
-            if (s.classList.contains("ok") || tries >= 10) {
-              clearInterval(timer);
-            }
+            window.pywebview.api.check_cdp_status().then(
+              function(state) {
+                if (state === "connected") {
+                  status.textContent = "✅ Подключено";
+                  status.className = "cdp-status ok";
+                  clearInterval(timer);
+                  btn.disabled = false;
+                  btn.textContent = "🚀 Запустить Chrome";
+                  setGeminiConnected();
+                  setTimeout(closeCdpModal, 1500);
+                } else if (state === "connecting") {
+                  status.textContent = "⏳ Подключаюсь к Gemini...";
+                  status.className = "cdp-status waiting";
+                } else if (state === "cdp_ready") {
+                  status.textContent = "⏳ Подключаюсь к Gemini...";
+                  status.className = "cdp-status waiting";
+                  if (!window._connect_triggered) {
+                    window._connect_triggered = true;
+                    window.pywebview.api.start_gemini_connect();
+                  }
+                } else if (tries >= 10) {
+                  status.textContent = "⏳ Таймаут — попробуйте Проверить подключение";
+                  status.className = "cdp-status waiting";
+                  clearInterval(timer);
+                  btn.disabled = false;
+                  btn.textContent = "🚀 Запустить Chrome";
+                }
+              },
+              function(err) {
+                if (tries >= 10) {
+                  status.textContent = "❌ Ошибка CDP: " + (err || "таймаут");
+                  status.className = "cdp-status error";
+                  clearInterval(timer);
+                  btn.disabled = false;
+                  btn.textContent = "🚀 Запустить Chrome";
+                }
+              }
+            );
           }, Math.random() * 200);
           delay = Math.min(delay * 1.2, 2000);
         }, delay);
@@ -163,6 +198,56 @@ function launchChromeCDP() {
       }
     );
   }
+}
+
+// ── Stop / Cancel ──
+
+let exportStateDS = "idle"; // idle | running | cancelling
+let exportStateGM = "idle";
+
+function cancelDeepSeek() {
+  if (exportStateDS !== "running") return;
+  exportStateDS = "cancelling";
+  document.getElementById("btnStopDS").disabled = true;
+  document.getElementById("btnStopDS").textContent = "⏹ Останавливаю...";
+  Promise.resolve(
+    window.pywebview?.api?.cancel_deepseek_export?.()
+  ).finally(() => {
+    log("DeepSeek cancel requested");
+    hideStopButtonDS();
+  });
+}
+
+function cancelGemini() {
+  if (exportStateGM !== "running") return;
+  exportStateGM = "cancelling";
+  document.getElementById("btnStopGM").disabled = true;
+  document.getElementById("btnStopGM").textContent = "⏹ Останавливаю...";
+  Promise.resolve(
+    window.pywebview?.api?.cancel_gemini_export?.()
+  ).finally(() => {
+    log("Gemini cancel requested");
+    hideStopButtonGM();
+  });
+}
+
+function showStopButtonDS() {
+  exportStateDS = "running";
+  const btn = document.getElementById("btnStopDS");
+  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
+}
+function hideStopButtonDS() {
+  exportStateDS = "idle";
+  document.getElementById("btnStopDS").classList.add("hidden");
+}
+function showStopButtonGM() {
+  exportStateGM = "running";
+  const btn = document.getElementById("btnStopGM");
+  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
+}
+function hideStopButtonGM() {
+  exportStateGM = "idle";
+  document.getElementById("btnStopGM").classList.add("hidden");
 }
 
 // ── Sync ──
@@ -192,10 +277,12 @@ function getActiveUrl() {
 function _runSync(urls, btn) {
   btn.disabled = true;
   btn.textContent = "Exporting...";
+  showStopButtonDS();
 
   if (window.pywebview) {
     window.pywebview.api.sync_provider(JSON.stringify(urls)).then(
       function() {
+        hideStopButtonDS();
         btn.disabled = false;
         btn.textContent = btn.id === "btnSyncAll"
           ? "Синхронизировать DeepSeek"
@@ -204,6 +291,7 @@ function _runSync(urls, btn) {
         setBridgeStatus("ready");
       },
       function(err) {
+        hideStopButtonDS();
         btn.disabled = false;
         btn.textContent = btn.id === "btnSyncAll"
           ? "Синхронизировать DeepSeek"
@@ -358,9 +446,11 @@ function getActiveGeminiUrl() {
 function _runGeminiSync(urls, btn) {
   btn.disabled = true;
   btn.textContent = "Exporting...";
+  showStopButtonGM();
   if (window.pywebview) {
     window.pywebview.api.sync_gemini(JSON.stringify(urls))
       .then(function(resp) {
+        hideStopButtonGM();
         btn.disabled = false;
         btn.textContent = btn.id === "btnGeminiSyncAll"
           ? "Синхронизировать Gemini"
@@ -373,6 +463,7 @@ function _runGeminiSync(urls, btn) {
         setBridgeStatus("ready");
       })
       .catch(function(err) {
+        hideStopButtonGM();
         btn.disabled = false;
         btn.textContent = btn.id === "btnGeminiSyncAll"
           ? "Синхронизировать Gemini"
@@ -383,14 +474,8 @@ function _runGeminiSync(urls, btn) {
 }
 
 function syncGeminiAll() {
-  const el = document.getElementById("gmUrls");
-  const urls = el.value.split("\n").map(function(s) { return s.trim(); }).filter(Boolean);
-  if (urls.length === 0) {
-    log("Gemini sync all: auto-discovering URLs from sidebar...");
-  } else {
-    log("Gemini sync all: " + urls.length + " urls");
-  }
-  _runGeminiSync(urls, document.getElementById("btnGeminiSyncAll"));
+  log("Gemini sync all: auto-discovering URLs from sidebar...");
+  _runGeminiSync([], document.getElementById("btnGeminiSyncAll"));
 }
 
 function syncGeminiSelected() {
@@ -404,6 +489,7 @@ function syncGeminiSelected() {
 }
 
 function reconnectGemini() {
+  window._connect_triggered = false;
   log("reconnect Gemini");
   openCdpModal();
 }

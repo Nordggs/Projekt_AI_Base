@@ -93,13 +93,15 @@
           </div>
         </div>
 
+        <button id="btnGeminiSyncAll" class="primary" disabled onclick="syncGeminiAll()">Синхронизировать Gemini</button>
+        <button id="btnStopGM" class="danger hidden" onclick="cancelGemini()">⏹ Остановить</button>
+
         <!-- URL list (hidden until connected) -->
         <div id="geminiUrls" class="url-area hidden">
           <label for="gmUrls">URL чатов (по одному на строке):</label>
           <textarea id="gmUrls" placeholder="https://gemini.google.com/app/..."></textarea>
         </div>
 
-        <button id="btnGeminiSyncAll" class="primary" disabled onclick="syncGeminiAll()">Синхронизировать Gemini</button>
         <button id="btnGeminiSyncSelected" class="primary" disabled onclick="syncGeminiSelected()">Синхронизировать выбранный чат</button>
       </div>
 
@@ -140,6 +142,7 @@
         </div>
 
         <button id="btnSyncAll" class="primary" disabled onclick="syncAllDeepSeek()">Синхронизировать DeepSeek</button>
+        <button id="btnStopDS" class="danger hidden" onclick="cancelDeepSeek()">⏹ Остановить</button>
 
         <!-- URL list (hidden until connected) -->
         <div id="deepseekUrls" class="url-area hidden">

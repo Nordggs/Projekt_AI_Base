@@ -58,6 +58,46 @@ class API:
     def launch_chrome(self):
         return self._app.launch_chrome_cdp()
 
+    def check_cdp_status(self):
+        """Returns: 'connected' | 'connecting' | 'cdp_ready' | 'no_cdp'"""
+        a = self._app
+        if a._gemini_connect_state == "connected":
+            try:
+                if a.gemini_page and a.gemini_page.url:
+                    return "connected"
+            except Exception:
+                a._gemini_connect_state = "idle"
+        if a._gemini_connect_state == "connecting":
+            return "connecting"
+        if _check_cdp_alive():
+            return "cdp_ready"
+        return "no_cdp"
+
+    def start_gemini_connect(self):
+        a = self._app
+        if a._gemini_connect_lock:
+            return "BUSY"
+        if a._gemini_connect_state in ("connecting", "connected"):
+            return a._gemini_connect_state
+        threading.Thread(target=a._auto_connect_gemini, daemon=True).start()
+        return "starting"
+
+    def cancel_deepseek_export(self):
+        a = self._app
+        a._cancel_requested_deepseek = True
+        a._cancel_epoch_deepseek = time_module.time()
+        a._export_session_deepseek += 1
+        a.log.add("[INFO] DeepSeek export cancelled by user")
+        return a.save_log()
+
+    def cancel_gemini_export(self):
+        a = self._app
+        a._cancel_requested_gemini = True
+        a._cancel_epoch_gemini = time_module.time()
+        a._export_session_gemini += 1
+        a.log.add("[INFO] Gemini export cancelled by user")
+        return a.save_log()
+
     def save_ui_snapshot(self, content):
         threading.Thread(
             target=self._app.save_ui_snapshot,
@@ -109,11 +149,17 @@ class App:
         self._connect_error = None
         self._last_watched_url = ""
         self._export_active = False
+        self._cancel_requested_deepseek = False
+        self._cancel_epoch_deepseek = 0
+        self._export_session_deepseek = 0
+        self._cancel_requested_gemini = False
+        self._cancel_epoch_gemini = 0
+        self._export_session_gemini = 0
         self._output_folders = {
-            "deepseek": "raw/deepseek",
-            "chatgpt": "raw/chatgpt",
-            "gemini": "raw/gemini",
-            "claude": "raw/claude",
+            "deepseek": "raw",
+            "chatgpt": "raw",
+            "gemini": "raw",
+            "claude": "raw",
         }
 
         threading.Thread(target=self._pw_worker, daemon=True).start()
@@ -126,6 +172,9 @@ class App:
         self._connect_gemini_done = threading.Event()
         self._gemini_export_active = False
         self._gemini_writer = None
+        self._gemini_connect_lock = False
+        self._gemini_connect_state = "idle"  # idle | connecting | connected
+        self._gemini_last_fail_time = 0
         threading.Thread(target=self._gw_worker, daemon=True).start()
 
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -292,6 +341,12 @@ class App:
 
         if self.gemini_pw:
             try:
+                for ctx in self.gemini_pw.contexts:
+                    for p in ctx.pages:
+                        try:
+                            p.close()
+                        except Exception:
+                            pass
                 self.gemini_pw.close()
             except Exception:
                 pass
@@ -309,6 +364,7 @@ class App:
 
             self.gemini_pw = browser
             self.gemini_page = page
+            self._gemini_connect_state = "connected"
             self._connect_gemini_done.set()
             try:
                 self.window.evaluate_js("setGeminiConnected()")
@@ -316,8 +372,35 @@ class App:
                 pass
             self.log.add("[INFO] Gemini connected via CDP")
         except Exception as e:
+            self._gemini_connect_state = "idle"
+            self._gemini_last_fail_time = time_module.time()
             self.log.add(f"[ERROR] CDP attach failed: {e}")
             raise
+
+    def _auto_connect_gemini(self):
+        if self._gemini_connect_state == "connected":
+            try:
+                if self.gemini_page and self.gemini_page.url:
+                    return "connected"
+            except Exception:
+                self._gemini_connect_state = "idle"
+        self._gemini_connect_state = "connecting"
+        if self._gemini_last_fail_time and (time_module.time() - self._gemini_last_fail_time < 2):
+            self.log.add("[INFO] Gemini cooldown after fail, skipping auto-connect")
+            return "cooldown"
+        if not _check_cdp_alive():
+            return "no_cdp"
+        self.log.add("[INFO] Auto-connecting Gemini via CDP...")
+        try:
+            self.add_gemini_account("cdp")
+            self._gemini_connect_state = "connected"
+            self.log.add("[INFO] Gemini auto-connected")
+            return "connected"
+        except Exception as e:
+            self._gemini_connect_state = "idle"
+            self._gemini_last_fail_time = time_module.time()
+            self.log.add(f"[WARN] Gemini auto-connect failed: {e}")
+            return "failed"
 
     def _ensure_gemini_page(self):
         try:
@@ -334,6 +417,9 @@ class App:
 
     def _export_one(self, url):
         self.log.add(f"[INFO] Exporting {url[:60]}...")
+        if self._cancel_requested_deepseek:
+            self.log.add("[INFO] DeepSeek export cancelled mid-chat")
+            return False
 
         # scroll sidebar until target URL appears in visible DOM
         try:
@@ -405,16 +491,27 @@ class App:
 
         self._export_active = True
         self.writer = ExportWriter(out_dir=self._output_folders["deepseek"])
-        ok = 0
-        for url in urls:
-            if self._export_one(url):
-                ok += 1
-        self.log.add(f"[INFO] Batch done: {ok}/{len(urls)} OK")
-        self._push_log(f"Batch done: {ok}/{len(urls)} OK")
+        run_session = self._export_session_deepseek
         try:
-            self.window.evaluate_js("copyLogContent()")
-        except Exception:
-            pass
+            ok = 0
+            for url in urls:
+                if self._cancel_requested_deepseek:
+                    if run_session != self._export_session_deepseek:
+                        break  # stale cancel
+                    self.log.add("[INFO] DeepSeek export cancelled by user")
+                    self._push_log("⏹ DeepSeek export cancelled")
+                    break
+                if self._export_one(url):
+                    ok += 1
+            self.log.add(f"[INFO] Batch done: {ok}/{len(urls)} OK")
+            self._push_log(f"Batch done: {ok}/{len(urls)} OK")
+            try:
+                self.window.evaluate_js("copyLogContent()")
+            except Exception:
+                pass
+        finally:
+            self._cancel_requested_deepseek = False
+            self._export_active = False
 
     # ── Gemini export (isolated single-owner) ──
 
@@ -433,6 +530,9 @@ class App:
 
     def _export_gemini(self, url):
         self.log.add(f"[INFO] Exporting Gemini {url[:60]}...")
+        if self._cancel_requested_gemini:
+            self.log.add("[INFO] Gemini export cancelled mid-chat")
+            return None
 
         try:
             page = self._goto_gemini(url)
@@ -442,7 +542,7 @@ class App:
             if not data:
                 self.log.add("[INFO] RPC failed, using DOM extraction")
                 try:
-                    data = extract_gemini_dom(page, url)
+                    data = extract_gemini_dom(page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_requested_gemini, cancel_epoch=self._cancel_epoch_gemini)
                 except Exception as e:
                     self.log.add(f"[GEMINI][EXTRACT][FATAL] {e}")
                     return None
@@ -452,7 +552,17 @@ class App:
                 self._push_log("ERR: Gemini no data")
                 return None
 
+            if not data.get("messages"):
+                self.log.add("[ERROR] Gemini extraction returned 0 messages, skipping write")
+                self._push_log("Gemini ERR: 0 messages")
+                return None
+
             path = self._gemini_writer.write(data)
+            if not path:
+                self.log.add("[GEMINI][SKIP] writer returned None, no file created")
+                self._push_log("Gemini ERR: write failed")
+                return None
+
             n = len(data.get("messages", []))
             self.log.add(f"[SUCCESS] Gemini {n} msgs → {path.name}")
             self._push_log(f"Gemini OK: {n} msgs — {data.get('title', '?')}")
@@ -473,23 +583,36 @@ class App:
 
         self._gemini_export_active = True
         self._gemini_writer = ExportWriter(out_dir=self._output_folders["gemini"])
-        Path(self._output_folders["gemini"]).mkdir(parents=True, exist_ok=True)
-        self.log.add(f"[GEMINI] writer exists = {self._gemini_writer is not None}")
+        run_session = self._export_session_gemini
 
-        results = []
-        for url in urls:
-            self.log.add(f"[GEMINI] calling export for {url[:60]}")
-            r = self._export_gemini(url)
-            if r:
-                results.append(r)
-
-        total = sum(r["count"] for r in results) if results else 0
-        self.log.add(f"[INFO] Gemini batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-        self._push_log(f"Gemini batch: {total} msgs — {len(results)}/{len(urls)}")
         try:
-            self.window.evaluate_js("copyLogContent()")
-        except Exception:
-            pass
+            results = []
+            for idx, url in enumerate(urls, 1):
+                if self._cancel_requested_gemini:
+                    if run_session != self._export_session_gemini:
+                        break
+                    self.log.add("[INFO] Gemini export cancelled by user")
+                    self._push_log("⏹ Gemini export cancelled")
+                    break
+                self.log.add(f"[GEMINI] [{idx}/{len(urls)}] exporting {url[:40]}")
+                self._push_log(f"Gemini [{idx}/{len(urls)}]...")
+                r = self._export_gemini(url)
+                if r:
+                    results.append(r)
+                else:
+                    self.log.add(f"[GEMINI] export returned None for {url[:60]}")
+
+            total = sum(r["count"] for r in results) if results else 0
+            self.log.add(f"[INFO] Gemini batch done: {total} msgs from {len(results)}/{len(urls)} chats")
+            self._push_log(f"Gemini batch: {total} msgs — {len(results)}/{len(urls)}")
+            try:
+                self.window.evaluate_js("copyLogContent()")
+            except Exception:
+                pass
+        finally:
+            self._gemini_export_active = False
+            self._cancel_requested_gemini = False
+            self._cancel_epoch_gemini = 0
 
     # ── URL watcher (runs in _pw_worker idle loop) ──
 
@@ -632,13 +755,27 @@ class App:
     def add_gemini_account(self, url):
         if self._auto_reconnecting:
             return "BUSY"
-        self._connect_gemini_done.clear()
-        self._gw_queue.put(("connect_gemini", url))
-        if not self._connect_gemini_done.wait(timeout=30):
-            raise RuntimeError("Gemini CDP connection timeout")
-        if not self.gemini_pw:
-            raise RuntimeError("Gemini CDP connection failed")
-        return "OK"
+        if self._gemini_connect_lock:
+            return "BUSY"
+        if self._gemini_connect_state == "connected":
+            try:
+                if self.gemini_page and self.gemini_page.url:
+                    self.log.add("[INFO] Gemini already connected")
+                    return "OK"
+            except Exception:
+                self._gemini_connect_state = "idle"
+        self._gemini_connect_lock = True
+        try:
+            self._connect_gemini_done.clear()
+            self._gw_queue.put(("connect_gemini", url))
+            if not self._connect_gemini_done.wait(timeout=30):
+                raise RuntimeError("Gemini CDP connection timeout")
+            if not self.gemini_pw:
+                raise RuntimeError("Gemini CDP connection failed")
+            self._gemini_connect_state = "connected"
+            return "OK"
+        finally:
+            self._gemini_connect_lock = False
 
     def sync_gemini(self, urls_json):
         if not self.gemini_pw:
@@ -653,22 +790,64 @@ class App:
         return "STARTED"
 
     def reconnect_gemini(self):
-        self.log.add("[INFO] Reconnecting Gemini...")
-        if self.gemini_pw:
+        if self._gemini_connect_lock:
+            return "BUSY"
+        self._gemini_connect_lock = True
+        self._gemini_connect_state = "idle"
+        try:
+            self.log.add("[INFO] Reconnecting Gemini...")
+            if self.gemini_pw:
+                try:
+                    for ctx in self.gemini_pw.contexts:
+                        for p in ctx.pages:
+                            try:
+                                p.close()
+                            except Exception:
+                                pass
+                    self.gemini_pw.close()
+                except Exception:
+                    pass
+                self.gemini_pw = None
+                self.gemini_page = None
+            self.add_gemini_account("cdp")
+        finally:
+            self._gemini_connect_lock = False
+
+    def _close_cdp_browser(self):
+        if self._gemini_playwright:
             try:
-                self.gemini_pw.close()
-            except Exception:
-                pass
-            self.gemini_pw = None
-            self.gemini_page = None
-        self.add_gemini_account("cdp")
+                browser = self._gemini_playwright.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                for ctx in browser.contexts:
+                    for p in ctx.pages:
+                        try:
+                            p.close()
+                        except Exception:
+                            pass
+                browser.close()
+            except Exception as e:
+                self.log.add(f"[WARN] CDP close failed: {e}")
+
+        for _ in range(25):
+            if not _check_cdp_alive():
+                break
+            time_module.sleep(0.5)
+
+        if _check_cdp_alive():
+            self.log.add("[WARN] Chrome still alive → forcing termination")
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True)
+            time_module.sleep(1)
+
+        self.gemini_pw = None
+        self.gemini_page = None
 
     def launch_chrome_cdp(self):
         if _check_cdp_alive():
-            self.log.add("[INFO] CDP already active")
-            return "ALREADY_RUNNING"
+            self.log.add("[INFO] CDP alive — force restart Chrome session")
+            self._close_cdp_browser()
+            time_module.sleep(2)
 
         chrome_dir = os.path.expanduser("~/.ai_pipeline/chrome_gemini")
+        shutil.rmtree(chrome_dir, ignore_errors=True)
         os.makedirs(chrome_dir, exist_ok=True)
 
         paths = [
@@ -682,6 +861,10 @@ class App:
                 subprocess.Popen([
                     p, "--remote-debugging-port=9222",
                     f"--user-data-dir={chrome_dir}",
+                    "--no-first-run",
+                    "--disable-session-crashed-bubble",
+                    "--disable-features=InfiniteSessionRestore",
+                    "--restore-last-session=false",
                 ])
                 return "OK"
 

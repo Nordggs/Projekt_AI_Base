@@ -409,6 +409,23 @@ pre {
   -webkit-user-select: text;
 }
 
+.danger {
+  background: #d32f2f;
+  color: white;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.danger:hover {
+  background: #b71c1c;
+}
+.danger:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* CDP MODAL */
 .cdp-steps {
   margin: 10px 0;
