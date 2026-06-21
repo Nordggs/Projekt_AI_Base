@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.5 — Qwen Sidebar FSM (2026-06-22)
+
+### Changed
+- **Qwen navigation rebuilt**: removed SPA router (FAST/SAFE/FALLBACK), replaced with click-based sidebar FSM
+- `_export_qwen()` — uses index-based click iteration over sidebar items instead of `goto(/c/{id})` / `location.href`
+- `_do_export_qwen_batch()` — Sync All: sidebar DOM scan (12/12 chats) instead of API discovery (3/12); Sync Selected: click-by-index URL match
+- Diagnostics confirmed: `div.chat-item-drag` = stable source of truth, no API dependency
+
+### Added
+- `_click_qwen_chat(index)` — re-query DOM + click sidebar item `a.chat-item-drag-link`
+- `_wait_qwen_messages()` — post-click invariant: `messages > 0 && /c/ in URL`
+- `_load_qwen_sidebar()` — goto `chat.qwen.ai/` + wait for render
+
+### Removed
+- `_navigate_to_chat()` — 3-path SPA state machine (FAST/SAFE/FALLBACK)
+- `_is_chat_view()` — DOM-based chat view detector
+- `discover_qwen_sidebar_urls()` — dead code (API discovery via cdp_network)
+- `discover_all_qwen_urls()` — dead code (old DOM href-based discovery)
+- `window.stop()` call in Qwen export
+
+---
+
 ## v0.4.0 — Qwen CDP + Soft Recovery (2026-06-19)
 
 ### New

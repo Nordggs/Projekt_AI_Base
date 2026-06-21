@@ -564,30 +564,45 @@ function getActiveQwenUrl() {
   for (let i = 0; i < lines.length; i++) {
     pos += lines[i].length + 1;
     if (start <= pos) {
-      const url = lines[i].trim();
-      if (url) return url;
+      let url = lines[i].trim();
+      if (url) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+        return url;
+      }
       break;
     }
   }
   for (let i = 0; i < lines.length; i++) {
-    const url = lines[i].trim();
-    if (url) return url;
+    let url = lines[i].trim();
+    if (url) {
+      if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+      return url;
+    }
   }
   return "";
 }
 
 function _runQwenSync(urls, btn) {
-  btn.disabled = true;
+  if (window._qwen_sync_busy) { log("[QWEN] sync already in progress"); return; }
+  window._qwen_sync_busy = true;
+
+  var btnAll = document.getElementById("btnQwenSyncAll");
+  var btnSel = document.getElementById("btnQwenSyncSelected");
+  btnAll.disabled = true;
+  btnSel.disabled = true;
+
   btn.textContent = "Exporting...";
   showStopButtonQW();
   if (window.pywebview) {
     window.pywebview.api.sync_qwen(JSON.stringify(urls))
       .then(function(resp) {
         hideStopButtonQW();
-        btn.disabled = false;
+        btnAll.disabled = false;
+        btnSel.disabled = false;
         btn.textContent = btn.id === "btnQwenSyncAll"
           ? "Синхронизировать Qwen"
           : "Синхронизировать выбранный чат";
+        window._qwen_sync_busy = false;
         if (resp && resp.ok) {
           log("[QWEN] exported: " + resp.count + " msgs → " + resp.path);
         } else {
@@ -597,10 +612,12 @@ function _runQwenSync(urls, btn) {
       })
       .catch(function(err) {
         hideStopButtonQW();
-        btn.disabled = false;
+        btnAll.disabled = false;
+        btnSel.disabled = false;
         btn.textContent = btn.id === "btnQwenSyncAll"
           ? "Синхронизировать Qwen"
           : "Синхронизировать выбранный чат";
+        window._qwen_sync_busy = false;
         log("[QWEN ERROR] " + (err.message || err));
       });
   }
@@ -626,6 +643,51 @@ function reconnectQwen() {
   addQwenAccount();
 }
 
+function pasteQwenUrl() {
+  const input = prompt("Вставьте URL чата Qwen (можно несколько, по одному на строке):");
+  if (!input) return;
+  const ta = document.getElementById("qwUrls");
+  const existing = ta.value.trim();
+  ta.value = existing ? existing + "\n" + input.trim() : input.trim();
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  ta.dispatchEvent(new Event("change", { bubbles: true }));
+  log("URL(s) pasted into Qwen list");
+}
+
 document.addEventListener("DOMContentLoaded", function() {
   setTimeout(fadeSplash, 2500);
+
+  // Qwen DnD fix for pywebview — explicit event handlers for textarea
+  const qw = document.getElementById("qwUrls");
+  if (qw) {
+    qw.addEventListener("dragover", function(e) { e.preventDefault(); });
+    qw.addEventListener("drop", function(e) {
+      e.preventDefault();
+      const text = (e.dataTransfer.getData("text/plain") || e.dataTransfer.getData("text/uri-list") || "").trim();
+      if (text) {
+        const start = this.selectionStart;
+        const end = this.selectionEnd;
+        this.value = this.value.substring(0, start) + text + this.value.substring(end);
+        this.selectionStart = this.selectionEnd = start + text.length;
+        this.dispatchEvent(new Event("input", { bubbles: true }));
+        this.dispatchEvent(new Event("change", { bubbles: true }));
+        return;
+      }
+      // Fallback: file drop (blob or .txt)
+      const files = e.dataTransfer.files;
+      if (files && files.length > 0) {
+        const reader = new FileReader();
+        reader.onload = function(ev) {
+          const content = ev.target.result;
+          const start = qw.selectionStart;
+          const end = qw.selectionEnd;
+          qw.value = qw.value.substring(0, start) + content + qw.value.substring(end);
+          qw.selectionStart = qw.selectionEnd = start + content.length;
+          qw.dispatchEvent(new Event("input", { bubbles: true }));
+          qw.dispatchEvent(new Event("change", { bubbles: true }));
+        };
+        reader.readAsText(files[0]);
+      }
+    });
+  }
 });

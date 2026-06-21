@@ -21,8 +21,7 @@ from exporters.gemini_extract import (
     discover_gemini_sidebar_urls,
 )
 from exporters.qwen_extract import (
-    extract_qwen_dom,
-    discover_qwen_sidebar_urls,
+    extract_qwen_hybrid,
 )
 from exporters.playwright_browser import BrowserPlaywright
 from exporters.writer import ExportWriter
@@ -154,7 +153,6 @@ class App:
             js_api=self.api,
             width=1300,
             height=750,
-            icon='ui/icon.png',
         )
         self.log = LogBuffer()
         self.writer = ExportWriter()
@@ -194,6 +192,7 @@ class App:
         self._gemini_writer = None
         self._gemini_connect_lock = False
         self._gemini_connect_state = "idle"  # idle | connecting | connected
+        self._gemini_broken = False
         self._gemini_last_fail_time = 0
         self._cdp_lock = threading.Lock()
 
@@ -207,9 +206,7 @@ class App:
         self._export_session_qwen = 0
         self._qwen_export_active = False
         self._qwen_writer = None
-        self._qwen_fail_count = 0
-        self._qwen_last_fail_time = 0
-        self._qwen_page_state = "ok"  # ok | unstable | dead
+        self._qwen_session_epoch = 0
 
         threading.Thread(target=self._gw_worker, daemon=True).start()
 
@@ -229,20 +226,61 @@ class App:
 
     # ── Login detection ──
 
-    def _is_logged_in(self, page):
+    def _is_logged_in(self, page, log_reason=False):
         try:
-            return page.evaluate("""
-                () => {
-                    if (document.readyState !== "complete") return false;
-                    if (location.href.includes("login")) return false;
-                    const hasMessages = document.querySelectorAll('.ds-message').length > 0;
-                    const hasInput = document.querySelector('textarea, [contenteditable="true"]') !== null;
-                    const hasDS = document.querySelector('.ds-scroll-area, .the-header') !== null;
-                    return hasMessages || hasInput || hasDS;
-                }
+            raw = page.evaluate("""
+                () => JSON.stringify({
+                    readyState: document.readyState,
+                    href: location.href,
+                    hasMessages: document.querySelectorAll('.ds-message').length > 0,
+                    hasInput: document.querySelector('textarea, [contenteditable="true"]') !== null,
+                    hasDS: document.querySelector('.ds-scroll-area, .the-header') !== null,
+                    isLogin: location.href.includes('login')
+                })
             """)
-        except Exception:
+            info = json.loads(raw)
+            if info.get("readyState") != "complete":
+                if log_reason:
+                    self.log.add(f"[LOGIN] page not ready: {info['readyState']}")
+                return False
+            if info.get("isLogin"):
+                if log_reason:
+                    self.log.add(f"[LOGIN] login page: {info['href'][:80]}")
+                return False
+            logged = info.get("hasMessages") or info.get("hasInput") or info.get("hasDS")
+            if not logged and log_reason:
+                self.log.add(f"[LOGIN] no signals: {info}")
+            return logged
+        except Exception as e:
+            if log_reason:
+                self.log.add(f"[LOGIN] evaluate error: {e}")
             return False
+
+    # ── Qwen sidebar navigation helpers ──
+
+    def _click_qwen_chat(self, index):
+        """Click the index-th chat in the Qwen sidebar (re-query DOM each time)."""
+        self.qwen_page.evaluate("""(i) => {
+            const items = document.querySelectorAll('div.chat-item-drag a.chat-item-drag-link');
+            items[i]?.click();
+        }""", index)
+
+    def _wait_qwen_messages(self, timeout=30000):
+        """Wait for messages to appear AND a /c/ URL (post-click invariant)."""
+        self.qwen_page.wait_for_function("""() => {
+            const msgs = document.querySelectorAll('[class*="message"]');
+            return msgs.length > 0 && location.href.includes('/c/');
+        }""", timeout=timeout)
+
+    def _load_qwen_sidebar(self):
+        """Navigate to chat.qwen.ai/ and wait for sidebar to render. Returns item count."""
+        self.qwen_page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded", timeout=30000)
+        self.qwen_page.wait_for_timeout(3000)
+        total = self.qwen_page.evaluate("document.querySelectorAll('div.chat-item-drag').length")
+        if total < 5:
+            self.qwen_page.wait_for_timeout(3000)
+            total = self.qwen_page.evaluate("document.querySelectorAll('div.chat-item-drag').length")
+        return total
 
     # ── Page resolver (find sidebar page, not export tab) ──
 
@@ -336,8 +374,10 @@ class App:
         pw.page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
         start = time_module.time()
+        _login_attempts = 0
         while True:
-            if self._is_logged_in(pw.page):
+            _login_attempts += 1
+            if self._is_logged_in(pw.page, log_reason=(_login_attempts == 1)):
                 self.log.add("[INFO] DeepSeek account connected")
                 self.log_ui_event("add_account connected")
                 self.pw = pw
@@ -353,11 +393,16 @@ class App:
 
             elapsed = time_module.time() - start
 
-            if elapsed > MAX_LOGIN_HARD:
+            hard_limit = 30 if self._auto_reconnecting else MAX_LOGIN_HARD
+            if elapsed > hard_limit:
                 pw.close()
-                self._connect_error = f"Login timeout ({MAX_LOGIN_HARD // 60} min)"
+                if self._auto_reconnecting:
+                    self.log.add("[WARN] Auto-restore DeepSeek session timed out (30s)")
+                    self._connect_error = "Auto-restore timeout — please login manually"
+                else:
+                    self._connect_error = f"Login timeout ({MAX_LOGIN_HARD // 60} min)"
                 self._connect_done.set()
-                raise RuntimeError(f"Login timeout ({MAX_LOGIN_HARD // 60} min)")
+                raise RuntimeError(self._connect_error)
 
             if elapsed > MAX_LOGIN_SOFT and int(elapsed) % 10 == 0:
                 self.log.add(f"[WARN] Login taking longer than expected ({int(elapsed)}s)")
@@ -412,6 +457,7 @@ class App:
             self.gemini_pw = browser
             self.gemini_page = page
             self._gemini_connect_state = "connected"
+            self._gemini_broken = False
             self._connect_gemini_done.set()
             try:
                 self.window.evaluate_js("setGeminiConnected()")
@@ -635,6 +681,16 @@ class App:
         try:
             results = []
             for idx, url in enumerate(urls, 1):
+                # Layer 1: state latch
+                if self._gemini_broken:
+                    break
+
+                # Layer 2: pre-flight CDP check
+                if not _check_cdp_alive():
+                    self._gemini_broken = True
+                    self._push_log("Gemini ERR: CDP disconnected — batch aborted")
+                    break
+
                 if self._cancel_requested_gemini:
                     if run_session != self._export_session_gemini:
                         break
@@ -648,6 +704,12 @@ class App:
                     results.append(r)
                 else:
                     self.log.add(f"[GEMINI] export returned None for {url[:60]}")
+
+                # Layer 3: post-flight escalation
+                if r is None and not _check_cdp_alive():
+                    self._gemini_broken = True
+                    self._push_log("Gemini ERR: CDP lost — batch aborted")
+                    break
 
             total = sum(r["count"] for r in results) if results else 0
             self.log.add(f"[INFO] Gemini batch done: {total} msgs from {len(results)}/{len(urls)} chats")
@@ -670,9 +732,6 @@ class App:
         if not _check_cdp_alive():
             raise RuntimeError("CDP not available")
 
-        if self._reattach_qwen_page():
-            return
-
         if self.qwen_page:
             try:
                 self.qwen_page.close()
@@ -686,7 +745,16 @@ class App:
             page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded", timeout=15000)
             page.wait_for_timeout(1000)
 
+            canonical = "https://chat.qwen.ai/"
+            current = page.url.rstrip("/")
+            if current != canonical.rstrip("/"):
+                self.log.add(f"[QWEN] redirect detected: {current} → restoring canonical")
+                with self._cdp_lock:
+                    page.goto(canonical, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+
             self.qwen_page = page
+            self._qwen_session_epoch += 1
             self._qwen_connected = True
             try:
                 self.window.evaluate_js("setQwenConnected()")
@@ -699,90 +767,79 @@ class App:
             self.log.add(f"[ERROR] Qwen CDP attach failed: {e}")
             raise
 
-    def classify_qwen_failure(self, e):
-        s = str(e).lower()
-        if "target closed" in s:
-            return "target_closed"
-        if "execution context" in s:
-            return "context_destroyed"
-        if "navigation" in s:
-            return "navigation"
-        return "unknown"
-
     def ensure_qwen_alive(self):
         if not self.qwen_page:
             self._qwen_connected = False
-            self._qwen_page_state = "dead"
             return False
         try:
-            self.qwen_page.evaluate("1")
-            self._qwen_fail_count = 0
-            self._qwen_page_state = "ok"
+            self.qwen_page.url
             return True
-        except Exception as e:
-            reason = self.classify_qwen_failure(e)
-            url = getattr(self.qwen_page, "url", "?")
-            cdp_alive = _check_cdp_alive()
-            self._push_log(f"[QWEN][HEALTHCHECK] {reason} | url={url} | cdp={cdp_alive} | exc={repr(e)}")
-
-            if reason == "target_closed":
-                self.qwen_page = None
-                self._qwen_connected = False
-                self._qwen_page_state = "dead"
-                self._push_log("Qwen page lost — reconnect required")
-                return False
-
-            self._qwen_page_state = "unstable"
-            self._qwen_fail_count += 1
-            self._qwen_last_fail_time = time.time()
-
-            if self._qwen_fail_count >= 3:
-                self._push_log(f"[QWEN] {self._qwen_fail_count} failures, reloading page...")
-                try:
-                    self.qwen_page.reload(wait_until="domcontentloaded", timeout=30000)
-                    self.qwen_page.wait_for_timeout(2000)
-                    self._qwen_fail_count = 0
-                    self._qwen_page_state = "ok"
-                    return True
-                except Exception as reload_e:
-                    self._push_log(f"[QWEN] reload failed: {reload_e}")
-                    self.qwen_page = None
-                    self._qwen_connected = False
-                    self._qwen_page_state = "dead"
-                    return False
-
+        except Exception:
+            self.qwen_page = None
+            self._qwen_connected = False
+            self._push_log("Qwen page lost — reconnect required")
             return False
 
-    def _reattach_qwen_page(self):
-        try:
-            ctx = self.gemini_pw.contexts[0]
-            for p in ctx.pages:
-                url = p.url or ""
-                if "chat.qwen.ai" in url and "/login" not in url:
-                    self.qwen_page = p
-                    self._qwen_connected = True
-                    self._qwen_fail_count = 0
-                    self._qwen_page_state = "ok"
-                    self._push_log(f"[QWEN] reattached to page: {url[:60]}")
-                    return True
-        except Exception as e:
-            self._push_log(f"[QWEN] reattach failed: {e}")
-        return False
+    def _export_qwen(self, url, epoch=0):
+        if epoch and self._qwen_session_epoch != epoch:
+            self.log.add(f"[EXPORT][RACE] epoch_mismatch expected={epoch} current={self._qwen_session_epoch}")
+            return None
 
-    def _export_qwen(self, url):
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+
+        chat_id = url.rstrip("/").split("/")[-1]
         self.log.add(f"[INFO] Exporting Qwen {url[:60]}...")
         if self._cancel_requested_qwen:
             self.log.add("[INFO] Qwen export cancelled mid-chat")
             return None
-        if not self.ensure_qwen_alive():
-            return None
 
         try:
+            # Load chat list (sidebar)
             with self._cdp_lock:
-                self.qwen_page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                self.qwen_page.wait_for_timeout(2000)
+                try:
+                    total = self._load_qwen_sidebar()
+                except Exception:
+                    pass
+                current = self.qwen_page.url
+                if "/auth" in current or "/login" in current:
+                    self.log.add("[WARN] Qwen redirected to auth page, need re-login")
+                    self._push_log("Qwen ERR: session expired — re-login required")
+                    return None
 
-            data = extract_qwen_dom(self.qwen_page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_requested_qwen, cancel_epoch=self._cancel_epoch_qwen)
+            if epoch and self._qwen_session_epoch != epoch:
+                self.log.add(f"[EXPORT][RACE] epoch_mismatch_after_goto expected={epoch} current={self._qwen_session_epoch}")
+                return None
+
+            total = self.qwen_page.evaluate("document.querySelectorAll('div.chat-item-drag').length")
+            self.log.add(f"[QWEN] sidebar: {total} items, searching for {chat_id[:12]}")
+            self._push_log(f"Qwen search: {chat_id[:12]}")
+
+            found = False
+            for i in range(total):
+                if self._cancel_requested_qwen:
+                    return None
+                if epoch and self._qwen_session_epoch != epoch:
+                    return None
+
+                with self._cdp_lock:
+                    self._click_qwen_chat(i)
+                    self.qwen_page.wait_for_timeout(2000)
+
+                if chat_id in self.qwen_page.url:
+                    found = True
+                    with self._cdp_lock:
+                        self._wait_qwen_messages()
+                        self.qwen_page.wait_for_timeout(500)
+                    self.log.add(f"[QWEN] found chat {chat_id[:12]} at index {i}")
+                    break
+
+            if not found:
+                self.log.add(f"[ERROR] Qwen chat {chat_id[:12]} not found in sidebar")
+                self._push_log("Qwen ERR: chat not found in sidebar")
+                return None
+
+            data = extract_qwen_hybrid(self.qwen_page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_requested_qwen, cancel_epoch=self._cancel_epoch_qwen)
 
             if not data:
                 self.log.add("[ERROR] Qwen extraction returned no data")
@@ -829,8 +886,8 @@ class App:
     def sync_qwen(self, urls_json):
         if not self._qwen_connected:
             raise RuntimeError("Qwen not connected")
-        if not self.ensure_qwen_alive():
-            raise RuntimeError("Qwen page lost — reconnect required")
+        if not _check_cdp_alive():
+            raise RuntimeError("CDP not available")
         if self._qwen_export_active:
             raise RuntimeError("Qwen export already in progress")
         urls = json.loads(urls_json)
@@ -851,51 +908,121 @@ class App:
 
     def _do_export_qwen_batch(self, urls):
         self.log.add(f"[QWEN] batch start user_urls={urls}")
-        urls = urls or discover_qwen_sidebar_urls(self.qwen_page)
-        if not urls:
-            self.log.add("[ERROR] No Qwen chat URLs found")
-            self._push_log("Qwen ERR: no URLs found")
-            return
+        batch_epoch = self._qwen_session_epoch
+        self.log.add(f"[BATCH] start epoch={batch_epoch} page_url={self.qwen_page.url}")
 
         self._qwen_export_active = True
         self._qwen_writer = ExportWriter(out_dir=self._output_folders["qwen"])
-        run_session = self._export_session_qwen
 
         try:
-            try:
-                ctx = self.gemini_pw.contexts[0]
-                pages_info = [(p.url or "?", "") for p in ctx.pages]
-                self._push_log(f"[QWEN][CDP TARGETS] {pages_info}")
-            except Exception:
-                pass
+            # ── Sync Selected: user-provided URLs ──
+            if urls:
+                urls = list(dict.fromkeys(urls))
+                run_session = self._export_session_qwen
+                if len(urls) == 1:
+                    self._push_log("Qwen single-export mode: break on first success")
+
+                results = []
+                for idx, url in enumerate(urls, 1):
+                    if self._qwen_session_epoch != batch_epoch:
+                        self.log.add(f"[BATCH][RACE] epoch_mismatch expected={batch_epoch} current={self._qwen_session_epoch}")
+                        self._push_log("Qwen ERR: session changed")
+                        break
+                    if self._cancel_requested_qwen:
+                        if run_session != self._export_session_qwen:
+                            break
+                        self.log.add("[INFO] Qwen export cancelled by user")
+                        self._push_log("Qwen export cancelled")
+                        break
+                    if not _check_cdp_alive():
+                        self.log.add("[WARN] CDP not available, stopping batch")
+                        self._push_log("Qwen ERR: CDP lost")
+                        break
+
+                    self.log.add(f"[QWEN] [{idx}/{len(urls)}] exporting {url[:40]}")
+                    self._push_log(f"Qwen [{idx}/{len(urls)}]...")
+                    r = self._export_qwen(url, epoch=batch_epoch)
+                    if r:
+                        results.append(r)
+                        if len(urls) == 1:
+                            self.log.add("[QWEN] single-export success, breaking")
+                            break
+                    else:
+                        self.log.add(f"[QWEN] export returned None for {url[:60]}")
+
+                total = sum(r["count"] for r in results) if results else 0
+                self.log.add(f"[INFO] Qwen batch done: {total} msgs from {len(results)}/{len(urls)} chats")
+                self._push_log(f"Qwen batch: {total} msgs — {len(results)}/{len(urls)}")
+                return
+
+            # ── Sync All: sidebar-only FSM ──
+            with self._cdp_lock:
+                try:
+                    total = self._load_qwen_sidebar()
+                except Exception:
+                    pass
+                if "/auth" in self.qwen_page.url:
+                    self.log.add("[WARN] Qwen redirected to auth page, need re-login")
+                    self._push_log("Qwen ERR: session expired — re-login required")
+                    return
+
+            total = self.qwen_page.evaluate("document.querySelectorAll('div.chat-item-drag').length")
+            self.log.add(f"[QWEN] sidebar: {total} chats")
+            self._push_log(f"Qwen sidebar: {total} chats")
+
+            if total == 0:
+                self.log.add("[ERROR] No Qwen chats found in sidebar")
+                self._push_log("Qwen ERR: no chats in sidebar")
+                return
 
             results = []
-            for idx, url in enumerate(urls, 1):
+            run_session = self._export_session_qwen
+
+            for i in range(total):
+                if self._qwen_session_epoch != batch_epoch:
+                    self.log.add(f"[BATCH][RACE] epoch_mismatch expected={batch_epoch} current={self._qwen_session_epoch}")
+                    self._push_log("Qwen ERR: session changed")
+                    break
                 if self._cancel_requested_qwen:
                     if run_session != self._export_session_qwen:
                         break
                     self.log.add("[INFO] Qwen export cancelled by user")
-                    self._push_log("⏹ Qwen export cancelled")
+                    self._push_log("Qwen export cancelled")
                     break
-                if not self.ensure_qwen_alive():
-                    self.log.add("[WARN] Qwen page dead, stopping batch")
-                    self._push_log("Qwen ERR: page lost")
+                if not _check_cdp_alive():
+                    self.log.add("[WARN] CDP not available, stopping batch")
+                    self._push_log("Qwen ERR: CDP lost")
                     break
-                self.log.add(f"[QWEN] [{idx}/{len(urls)}] exporting {url[:40]}")
-                self._push_log(f"Qwen [{idx}/{len(urls)}]...")
-                r = self._export_qwen(url)
-                if r:
-                    results.append(r)
-                else:
-                    self.log.add(f"[QWEN] export returned None for {url[:60]}")
 
-            total = sum(r["count"] for r in results) if results else 0
-            self.log.add(f"[INFO] Qwen batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-            self._push_log(f"Qwen batch: {total} msgs — {len(results)}/{len(urls)}")
+                with self._cdp_lock:
+                    self._click_qwen_chat(i)
+                    self._wait_qwen_messages()
+                    self.qwen_page.wait_for_timeout(500)
+
+                url = self.qwen_page.url
+                data = extract_qwen_hybrid(self.qwen_page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_requested_qwen, cancel_epoch=self._cancel_epoch_qwen)
+
+                if data and data.get("messages"):
+                    path = self._qwen_writer.write(data)
+                    if path:
+                        n = len(data["messages"])
+                        results.append({"ok": True, "path": str(path), "count": n})
+                        self.log.add(f"[QWEN] [{i+1}/{total}] {n} msgs -> {path.name}")
+                        self._push_log(f"Qwen [{i+1}/{total}] OK: {n} msgs")
+                    else:
+                        self._push_log(f"Qwen [{i+1}/{total}] ERR: write failed")
+                else:
+                    self._push_log(f"Qwen [{i+1}/{total}] ERR: no data")
+
+            total_msgs = sum(r["count"] for r in results) if results else 0
+            self.log.add(f"[INFO] Qwen batch done: {total_msgs} msgs from {len(results)}/{total} chats")
+            self._push_log(f"Qwen batch: {total_msgs} msgs — {len(results)}/{total}")
+
             try:
                 self.window.evaluate_js("copyLogContent()")
             except Exception:
                 pass
+
         finally:
             self._qwen_export_active = False
             self._cancel_requested_qwen = False
@@ -1134,7 +1261,6 @@ class App:
             time_module.sleep(2)
 
         chrome_dir = os.path.expanduser("~/.ai_pipeline/chrome_gemini")
-        shutil.rmtree(chrome_dir, ignore_errors=True)
         os.makedirs(chrome_dir, exist_ok=True)
 
         paths = [
@@ -1151,7 +1277,6 @@ class App:
                     "--no-first-run",
                     "--disable-session-crashed-bubble",
                     "--disable-features=InfiniteSessionRestore",
-                    "--restore-last-session=false",
                 ])
                 return "OK"
 
@@ -1195,4 +1320,4 @@ class App:
 
 if __name__ == "__main__":
     app = App()
-    webview.start(debug=True)
+    webview.start(debug=True, icon='ui/icon.ico')

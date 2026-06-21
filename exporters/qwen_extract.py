@@ -1,5 +1,8 @@
 import json
+import re
 import time
+
+from exporters.cdp_snapshot import CdpSnapshotExtractor
 
 QWEN_DEBUG_JS = """
 () => {
@@ -66,7 +69,19 @@ QWEN_EXTRACT_JS = """
         const parts = allText.split('\\n').filter(l => l.trim().length > 20);
         messages.push({ role: 'assistant', content: parts.slice(0, 5).join('\\n\\n') || 'No structured messages found' });
     }
-    const title = document.title || 'Qwen Chat';
+    const title = (() => {
+        const links = document.querySelectorAll('a[href*="/c/"]');
+        for (const el of links) {
+            const t = (el.innerText || el.textContent || '').trim();
+            if (t && t.length > 1 && t.length < 200) return t;
+        }
+        const fallbacks = document.querySelectorAll('[class*="sidebar"] [class*="active"], [class*="menu"] [class*="active"], [class*="conversation"] [class*="active"]');
+        for (const el of fallbacks) {
+            const t = (el.innerText || el.textContent || '').trim();
+            if (t && t.length > 1 && t.length < 200) return t;
+        }
+        return document.title || 'Qwen Chat';
+    })();
     const chatId = (location.pathname.match(/\\/([^\\/?#]+)$/) || [])[1] || '';
     return JSON.parse(JSON.stringify({ title, chatId, messages, sourceUrl: location.href }));
 }
@@ -95,6 +110,22 @@ def extract_qwen_dom(page, url, log_progress=None, cancel_check=None, cancel_epo
     debug = json.loads(debug_info)
 
     log_progress(f"[QWEN_DEBUG] title={debug['title']}, selectors={json.dumps(debug['selectors'])}")
+
+    title_diag = page.evaluate("""
+        () => {
+            const sel = ['[class*="title"]', '[class*="name"]', 'h1', '[class*="heading"]', '[class*="tip-text"]', '[class*="chat-item-active"]'];
+            const out = [];
+            for (const s of sel) {
+                const el = document.querySelector(s);
+                if (el) {
+                    const t = (el.innerText || el.textContent || '').trim().substring(0, 100);
+                    out.push({sel, tag: el.tagName, cls: (el.className || '').substring(0, 80), text: t});
+                }
+            }
+            return JSON.stringify(out);
+        }
+    """)
+    log_progress(f"[QWEN_TITLE] {title_diag}")
 
     merged, seen = [], set()
     title, chat_id = '', ''
@@ -171,66 +202,48 @@ def extract_qwen_dom(page, url, log_progress=None, cancel_check=None, cancel_epo
     }
 
 
-def discover_qwen_sidebar_urls(page) -> list[str]:
+def normalize_snapshot(messages, url):
+    if not messages:
+        return None
+    chat_id = ""
+    m = __import__("re").search(r"/([^/?]+)$", url)
+    if m:
+        chat_id = m.group(1)
+    return {
+        "schema_version": 1,
+        "source": "qwen",
+        "chat_id": chat_id or "",
+        "title": "Qwen Chat",
+        "source_url": url,
+        "messages": messages,
+    }
+
+
+def extract_qwen_hybrid(page, url, log_progress=None, cancel_check=None, cancel_epoch=0):
     try:
-        urls = page.evaluate("""
-            () => [...new Set(
-                [...document.querySelectorAll('a[href*="/c/"], a[href*="/chat/"], a[href*="/conversation/"]')]
-                    .map(a => {
-                        let h = a.getAttribute('href');
-                        if (!h) return null;
-                        if (h.startsWith('/')) return 'https://chat.qwen.ai' + h;
-                        if (h.includes('chat.qwen.ai')) return h;
-                        return null;
-                    })
-                    .filter(Boolean)
-            )]
-        """)
-        return urls or []
-    except Exception:
-        return []
+        data = extract_qwen_dom(page, url, log_progress=log_progress, cancel_check=cancel_check, cancel_epoch=cancel_epoch)
+        if data and data.get("messages"):
+            return data
+    except Exception as e:
+        if log_progress:
+            try:
+                url_info = page.url
+            except Exception:
+                url_info = "<unavailable>"
+            log_progress(f"[QWEN] evaluate failed: {e} — page.url={url_info}")
+        pass
 
+    if log_progress:
+        log_progress("[QWEN] falling back to DOMSnapshot...")
 
-def discover_all_qwen_urls(page) -> list[str]:
+    snap = CdpSnapshotExtractor(page)
     try:
-        all_urls = set()
-        seen_set = set()
-        stable = 0
-        MAX_STABLE = 5
-        MAX_ITER = 40
-
-        for _ in range(MAX_ITER):
-            urls = page.evaluate("""
-                () => [...new Set(
-                    [...document.querySelectorAll('a[href*="/c/"], a[href*="/chat/"], a[href*="/conversation/"]')]
-                        .map(a => {
-                            let h = a.getAttribute('href');
-                            if (!h) return null;
-                            if (h.startsWith('/')) return 'https://chat.qwen.ai' + h;
-                            if (h.includes('chat.qwen.ai')) return h;
-                            return null;
-                        })
-                        .filter(Boolean)
-                )]
-            """)
-            current = set(urls or [])
-            if current.issubset(seen_set):
-                stable += 1
-                if stable >= MAX_STABLE:
-                    break
-            else:
-                stable = 0
-                seen_set |= current
-                all_urls |= current
-
-            page.evaluate("""
-                () => {
-                    const c = document.querySelector('[class*="sidebar"], [class*="nav"], [class*="menu"], nav, [class*="list"]');
-                    if (c) c.scrollTop += 300;
-                }
-            """)
-            page.wait_for_timeout(300)
-
-        return list(all_urls)
-    except Exception:
-        return []
+        raw = snap.capture_conversation()
+        if not raw:
+            return None
+        data = normalize_snapshot(raw, url)
+        if log_progress:
+            log_progress(f"[QWEN] snapshot: {len(raw)} msgs")
+        return data
+    finally:
+        snap.close()

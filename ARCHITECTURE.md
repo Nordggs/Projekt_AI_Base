@@ -1,4 +1,4 @@
-# Architecture — AI Chat Exporter v0.4.0
+# Architecture — AI Chat Exporter v0.5.0-dev
 
 ## Overview
 
@@ -85,13 +85,14 @@ Desktop application for exporting AI chat conversations (Gemini, DeepSeek, Qwen)
 | `_export_gemini(url)` | Full export pipeline: goto → RPC → DOM → write |
 | `_do_export_gemini_batch(urls)` | Loop over URLs, collect results, log totals |
 | `_do_connect_qwen()` | Создаёт страницу Qwen в существующем CDP контексте |
-| `_reattach_qwen_page()` | Поиск живой вкладки Qwen в CDP по `chat.qwen.ai` в URL |
-| `ensure_qwen_alive()` | Healthcheck с классификацией ошибок и soft recovery |
-| `classify_qwen_failure(e)` | Различает `target_closed` / `context_destroyed` / `navigation` |
-| `_export_qwen(url)` | Qwen export pipeline: goto → DOM scroll-loop → write |
-| `_do_export_qwen_batch(urls)` | Loop с CDP targets logging и soft recovery |
+| `ensure_qwen_alive()` | Проверяет доступность page (`.url` без evaluate) |
+| `_load_qwen_sidebar()` | Goto `chat.qwen.ai/` + wait for sidebar render, return item count |
+| `_click_qwen_chat(index)` | Re-query DOM + click `div.chat-item-drag a.chat-item-drag-link[i]` |
+| `_wait_qwen_messages()` | Post-click guard: `messages > 0 && /c/ in URL` |
+| `_export_qwen(url)` | Sync Selected: load sidebar → click-by-index until URL match → extract |
+| `_do_export_qwen_batch(urls)` | Sync All (empty urls): sidebar-only FSM, iterate all items; Sync Selected (urls): delegate to `_export_qwen()` |
 | `add_qwen_account()` | API: постановка в очередь connect_qwen |
-| `sync_qwen(urls)` | API: проверка alive → enqueue |
+| `sync_qwen(urls)` | API: проверка CDP alive → enqueue |
 | `reconnect_qwen()` | Close + re-create Qwen page |
 | `launch_chrome_cdp()` | Launch Chrome with `--remote-debugging-port=9222`, persistent profile |
 | `launch_chrome()` | API bridge |
@@ -116,15 +117,27 @@ Desktop application for exporting AI chat conversations (Gemini, DeepSeek, Qwen)
   1. **Stable**: 6 consecutive iterations with zero new deduped messages
   2. **No progress**: 10 iterations with same last-message fingerprint (first 200 chars)
 
-#### Qwen (`exporters/qwen_extract.py`)
+#### Qwen (`exporters/qwen_extract.py` + `exporters/cdp_snapshot.py`)
 
-- DOM scroll-loop ingestor (up to 50 iterations, ~75s total)
-- `QWEN_EXTRACT_JS` — multiple selector candidates:
-  `.message-item`, `[class*="message"]`, `[data-role]`, `.user-message`, `.assistant-message`
-- `QWEN_SCROLL_JS` — scrolls `[class*="virtual"]` → `[class*="scroll"]` → `main` → `scrollingElement`
-- `QWEN_DEBUG_JS` — debug mode: dumps DOM structure on first run
-- `discover_qwen_sidebar_urls()` / `discover_all_qwen_urls()` — sidebar URL discovery
-- Stop conditions: stable 6 rounds | no-progress 10 rounds | max 50 iterations
+**Navigation (sidebar-only FSM)** — Qwen uses a React SPA without deep-link hydration or API-based chat list. Navigation is purely UI-driven:
+- Source of truth: sidebar DOM (`div.chat-item-drag`), not API, not URL
+- Discovery: `document.querySelectorAll('div.chat-item-drag').length` — counts all available chats
+- Navigation: `document.querySelectorAll('div.chat-item-drag a.chat-item-drag-link')[i].click()` — re-query DOM per click to avoid stale NodeList
+- Validation: `messages > 0 && location.href.includes('/c/')` — wait for post-click invariant
+- No `goto(/c/{id})`, no `location.href`, no `a[href]` selectors — SPA ignores direct URL navigation
+
+**Message extraction** — две стратегии, попытка evaluate → fallback на DOMSnapshot:
+- **Fast path** (`extract_qwen_dom`): DOM scroll-loop ingestor с `page.evaluate()`
+  - `QWEN_EXTRACT_JS` — multiple selector candidates:
+    `.message-item`, `[class*="message"]`, `[data-role]`, `.user-message`, `.assistant-message`
+  - `QWEN_SCROLL_JS` — scrolls `[class*="virtual"]` → `[class*="scroll"]` → `main` → `scrollingElement`
+  - `QWEN_DEBUG_JS` — debug mode: dumps DOM structure on first run (diagnostic only)
+- **Snap path** (`CdpSnapshotExtractor`): `DOMSnapshot.captureSnapshot` — renderer-level
+  - 1 CDP session per extractor lifecycle
+  - Incremental scroll + snapshot loop (convergence-based, not fixed steps)
+  - Position-aware dedupe: `(role, content, dom_position)`
+  - `capture_conversation()`: scroll → snapshot → merge → repeat until stable
+- `extract_qwen_hybrid()` — точка входа: evaluate → snapshot fallback
 
 #### Deduplication
 - `seen` set tracks `content[:120]` — only for merging, NOT for stop decisions
@@ -161,19 +174,29 @@ User clicks "+ аккаунт" on Qwen card
   → addQwenAccount()
     → _gw_queue.put("connect_qwen")
     → _do_connect_qwen()
-      → _reattach_qwen_page()? ← ищет живую вкладку
-      → ctx.new_page() — если reattach не удался
+      → ctx.new_page()
       → goto("https://chat.qwen.ai/")
 
-On export:
-  → ensure_qwen_alive() — healthcheck с классификацией
-    ├─ ok → continue
-    ├─ target_closed → page = None, return
-    ├─ navigation / context_destroyed → fail_count++, retry
-    └─ 3+ failures → reload page
-  → goto(chat_url) (under _cdp_lock)
-  → extract_qwen_dom() — scroll-loop
-  → writer.write()
+Sync All (sidebar-only FSM):
+  → goto("https://chat.qwen.ai/") (under _cdp_lock)
+  → total = querySelectorAll('div.chat-item-drag').length
+  → for i in range(total):
+      → click(a.chat-item-drag-link[i]) — re-query DOM per iteration
+      → wait_for_function(messages > 0 && /c/ in URL)
+      → extract_qwen_hybrid():
+          try:
+            → extract_qwen_dom() — evaluate-based scroll-loop
+          except:
+            → CdpSnapshotExtractor.capture_conversation()
+              → scroll → DOMSnapshot → extract → merge (stable loop)
+      → writer.write()
+
+Sync Selected (by URL):
+  → load sidebar (как выше)
+  → for i in range(total):
+      → click(i)
+      → if chat_id in page.url:
+          → extract → write → return
 ```
 
 ### 5. Writer (`exporters/writer.py`)
@@ -219,20 +242,32 @@ _gw_worker:
 UI paste URL → syncQwenSelected()
   → sync_qwen([url])
     → raise if not _qwen_connected
-    → ensure_qwen_alive()  ← healthcheck + soft recovery
     → _gw_queue.put("export_qwen_batch", urls)
 
 _gw_worker:
   → _do_export_qwen_batch(urls)
-    → log CDP targets
     → ExportWriter(out_dir="raw/qwen")
-    → for each url:
-        → _export_qwen(url)
-          → ensure_qwen_alive()  ← healthcheck + backoff
-          → goto(url) (under _cdp_lock)
-          → extract_qwen_dom()  ← scroll-loop
+
+    # Sync All (empty urls) — sidebar-only FSM
+    if not urls:
+      → _load_qwen_sidebar()
+        → goto("https://chat.qwen.ai/")
+        → total = querySelectorAll('div.chat-item-drag').length
+      → for i in range(total):
+          → _click_qwen_chat(i)
+          → _wait_qwen_messages()
+          → extract_qwen_hybrid()  ← scroll-loop
           → ExportWriter.write()
-    → log "X msgs from Y/Z chats"
+      → log "X msgs from Y/Z total chats"
+
+    # Sync Selected (user-provided urls)
+    else:
+      → for each url:
+          → _export_qwen(url)
+            → _load_qwen_sidebar()
+            → iterate over items[i]:
+                click(i)
+                if chat_id in url → extract → write → break
 ```
 
 ---
@@ -268,25 +303,27 @@ Used in:
 
 ---
 
-## Qwen Soft Recovery (v0.4.0)
+## Qwen Navigation & Extraction Stability (v0.5.0-dev)
 
-Qwen CDP target is inherently unstable (SPA redirects, context regeneration, anti-automation reset). The soft recovery model handles this:
+Qwen uses a React SPA without deep-link hydration or API-based chat list. Two independent layers: **navigation** (sidebar-only DOM FSM) and **extraction** (hybrid evaluate + snapshot). The hybrid extraction model eliminates dependency on JS runtime:
 
 ```
-evaluate fail → classify_qwen_failure()
-  ├─ "target_closed"      → page = None, reconnect required
-  ├─ "context_destroyed"  → fail_count++, page KEPT, retry
-  ├─ "navigation"         → fail_count++, page KEPT, retry
-  └─ "unknown"            → fail_count++, page KEPT, retry
-         │
-         └─ fail_count >= 3 → page.reload(), backoff
+extract_qwen_hybrid():
+  try:
+    → page.evaluate() — fast path (JS runtime)
+  except:
+    → CdpSnapshotExtractor.capture_conversation()
+      → 1 CDP session per extractor
+      → scroll → DOMSnapshot.captureSnapshot → extract
+      → repeat until convergence (stable iterations)
+      → dedupe by (role, content, dom_position)
 
-state: _qwen_page_state ∈ { "ok" | "unstable" | "dead" }
+Key properties:
+  • renderer-level extraction — no JS execution context dependency
+  • survives SPA reload, navigation, context destruction
+  • virtualized chat support — incremental scroll snapshots
+  • no healthchecks, no reconnect loops, no recovery logic
 ```
-
-Additional recovery:
-- `_reattach_qwen_page()` — scans `ctx.pages` for existing Qwen tab before creating a new one
-- `_cdp_lock` — prevents race conditions between Gemini/Qwen on shared CDP context
 
 ---
 
@@ -307,9 +344,10 @@ Additional recovery:
 ├── exporters/
 │   ├── __init__.py
 │   ├── base.py                  # Browser abstraction (webview/playwright modes)
+│   ├── cdp_snapshot.py          # CdpSnapshotExtractor — DOMSnapshot.captureSnapshot
 │   ├── deepseek.py              # DeepSeekExporter (legacy scroll engine)
 │   ├── gemini_extract.py        # Gemini RPC + DOM extraction, scroll-loop
-│   ├── qwen_extract.py          # Qwen DOM extraction, scroll-loop, URL discovery
+│   ├── qwen_extract.py          # Qwen hybrid extraction (evaluate + snapshot)
 │   ├── playwright_browser.py    # BrowserPlaywright wrapper
 │   └── writer.py                # ExportWriter (Markdown output)
 ├── ui/
