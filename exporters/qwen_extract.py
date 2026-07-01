@@ -62,7 +62,20 @@ QWEN_EXTRACT_JS = """
         const dataRole = el.getAttribute('data-role') || '';
         if (cls.includes('user') || dataRole === 'user') role = 'user';
         if (cls.includes('assistant') || dataRole === 'assistant') role = 'assistant';
-        messages.push({ role, content: text });
+        let timestamp = null;
+        const te = el.querySelector('time, [datetime], [class*="time"], [data-timestamp]');
+        if (te) {
+            const dt = te.getAttribute('datetime') || te.getAttribute('data-timestamp') || te.getAttribute('title') || te.innerText;
+            if (dt) timestamp = dt.trim().slice(0, 19).replace('T', ' ');
+        }
+        if (!timestamp) {
+            const small = el.querySelector('span, small, [class*="ts"], [class*="time"]');
+            if (small) {
+                const t = (small.innerText || '').trim();
+                if (t && t.length < 30 && /^\\d/.test(t)) timestamp = t;
+            }
+        }
+        messages.push({ role, content: text, timestamp });
     });
     if (messages.length === 0) {
         const allText = document.body?.innerText || '';

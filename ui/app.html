@@ -27,25 +27,6 @@
     </div>
   </div>
 
-  <!-- CDP MODAL (hidden by default) -->
-  <div id="cdpModal" class="modal hidden">
-    <div class="modal-content">
-      <h3>Подключение Gemini</h3>
-      <div class="cdp-steps">
-        <p>1. Запустите Chrome с CDP:</p>
-        <button class="primary" id="btnLaunchChrome" onclick="launchChromeCDP()">🚀 Запустить Chrome</button>
-        <p>2. Откройте <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> и войдите в аккаунт Google</p>
-      </div>
-      <div class="cdp-check-area">
-        <button class="primary" id="btnCdpCheck" onclick="checkGeminiCDP()">Проверить подключение</button>
-        <div id="cdpStatus" class="cdp-status"></div>
-      </div>
-      <div class="modal-actions">
-        <button class="cancel" onclick="closeCdpModal()">Отмена</button>
-      </div>
-    </div>
-  </div>
-
   <div class="app">
 
     <!-- TOP BAR -->
@@ -60,6 +41,21 @@
       </button>
     </div>
 
+    <!-- CDP BAR (global infrastructure status) -->
+    <div id="cdpBar" class="cdp-bar">
+      <span class="cdp-label" id="cdpIndicator">🔗 CDP: <span class="status-dot dot-off">○</span> не запущен</span>
+      <button id="btnStartCdp" class="small" onclick="startCdp()">▶ Запустить Chrome</button>
+      <button id="btnStopCdp" class="small danger hidden" onclick="stopCdp()">⏹ Остановить</button>
+      <button id="btnRestartCdp" class="small hidden" onclick="restartCdp()">⟳ Перезапустить</button>
+      <span class="cdp-providers">
+        <span class="pv-item"><span id="pvGemini" class="pv-dot dot-off">○</span> Gemini</span>
+        <span class="pv-item"><span id="pvQwen" class="pv-dot dot-off">○</span> Qwen</span>
+        <span class="pv-item"><span id="pvChatGPT" class="pv-dot dot-off">○</span> ChatGPT</span>
+        <span class="pv-item"><span id="pvClaude" class="pv-dot dot-off">○</span> Claude</span>
+        <span class="pv-item"><span id="pvDeepSeek" class="pv-dot dot-off">○</span> DeepSeek</span>
+      </span>
+    </div>
+
     <!-- PROVIDERS -->
     <div class="grid">
 
@@ -68,14 +64,32 @@
         <div class="card-header">
           <h2>ChatGPT</h2>
           <span class="badge">Нет аккаунтов</span>
-          <button class="small" onclick="addAccount('chatgpt')">+ аккаунт</button>
+          <button class="small" onclick="addChatGPTAccount()">+ аккаунт</button>
         </div>
 
-        <div class="empty">
-          Добавьте профиль аккаунта для авторизации.
+        <div class="empty" id="cgEmpty">
+          Подключите аккаунт ChatGPT для авторизации.
         </div>
 
-        <button class="primary" disabled>Синхронизировать ChatGPT</button>
+        <!-- Account info (hidden until connected) -->
+        <div id="cgAccount" class="account hidden">
+          <div class="name">ChatGPT</div>
+          <div class="status ok">подключен</div>
+          <div class="actions">
+            <button onclick="reconnectChatGPT()">переподключить</button>
+          </div>
+        </div>
+
+        <button id="btnChatGPTSyncAll" class="primary" disabled onclick="syncChatGPTAll()">Синхронизировать ChatGPT</button>
+        <button id="btnStopCG" class="danger" onclick="cancelAll()">⏹ Остановить</button>
+
+        <!-- URL list (hidden until connected) -->
+        <div id="chatgptUrls" class="url-area hidden">
+          <label for="cgUrls">URL чатов (по одному на строке):</label>
+          <textarea id="cgUrls" placeholder="https://chatgpt.com/c/..."></textarea>
+        </div>
+
+        <button id="btnChatGPTSyncSelected" class="primary" disabled onclick="syncChatGPTSelected()">Синхронизировать выбранный чат</button>
       </div>
 
       <!-- GEMINI -->
@@ -83,7 +97,7 @@
         <div class="card-header">
           <h2>Gemini</h2>
           <span class="badge">Нет аккаунтов</span>
-          <button class="small" onclick="addAccount('gemini')">+ аккаунт</button>
+          <button class="small" onclick="addGeminiAccount()">+ аккаунт</button>
         </div>
 
         <div class="empty" id="gmEmpty">
@@ -100,7 +114,7 @@
         </div>
 
         <button id="btnGeminiSyncAll" class="primary" disabled onclick="syncGeminiAll()">Синхронизировать Gemini</button>
-        <button id="btnStopGM" class="danger hidden" onclick="cancelGemini()">⏹ Остановить</button>
+        <button id="btnStopGM" class="danger" onclick="cancelAll()">⏹ Остановить</button>
 
         <!-- URL list (hidden until connected) -->
         <div id="geminiUrls" class="url-area hidden">
@@ -112,18 +126,36 @@
       </div>
 
       <!-- CLAUDE -->
-      <div class="card disabled">
+      <div class="card claude">
         <div class="card-header">
           <h2>Claude</h2>
           <span class="badge">Нет аккаунтов</span>
-          <button class="small" onclick="addAccount('claude')">+ аккаунт</button>
+          <button class="small" onclick="addClaudeAccount()">+ аккаунт</button>
         </div>
 
-        <div class="empty">
-          Добавьте профиль аккаунта для авторизации.
+        <div class="empty" id="clEmpty">
+          Подключите аккаунт Claude для авторизации.
         </div>
 
-        <button class="primary" disabled>Синхронизировать Claude</button>
+        <!-- Account info (hidden until connected) -->
+        <div id="clAccount" class="account hidden">
+          <div class="name">Claude</div>
+          <div class="status ok">подключен</div>
+          <div class="actions">
+            <button onclick="reconnectClaude()">переподключить</button>
+          </div>
+        </div>
+
+        <button id="btnClaudeSyncAll" class="primary" disabled onclick="syncClaudeAll()">Синхронизировать Claude</button>
+        <button id="btnStopCL" class="danger" onclick="cancelAll()">⏹ Остановить</button>
+
+        <!-- URL list (hidden until connected) -->
+        <div id="claudeUrls" class="url-area hidden">
+          <label for="clUrls">URL чатов (по одному на строке):</label>
+          <textarea id="clUrls" placeholder="https://claude.ai/chat/..."></textarea>
+        </div>
+
+        <button id="btnClaudeSyncSelected" class="primary" disabled onclick="syncClaudeSelected()">Синхронизировать выбранный чат</button>
       </div>
 
       <!-- QWEN -->
@@ -148,7 +180,7 @@
         </div>
 
         <button id="btnQwenSyncAll" class="primary" disabled onclick="syncQwenAll()">Синхронизировать Qwen</button>
-        <button id="btnStopQW" class="danger hidden" onclick="cancelQwen()">⏹ Остановить</button>
+        <button id="btnStopQW" class="danger" onclick="cancelAll()">⏹ Остановить</button>
 
         <!-- URL list (hidden until connected) -->
         <div id="qwenUrls" class="url-area hidden">
@@ -182,7 +214,7 @@
         </div>
 
         <button id="btnSyncAll" class="primary" disabled onclick="syncAllDeepSeek()">Синхронизировать DeepSeek</button>
-        <button id="btnStopDS" class="danger hidden" onclick="cancelDeepSeek()">⏹ Остановить</button>
+        <button id="btnStopDS" class="danger" onclick="cancelAll()">⏹ Остановить</button>
 
         <!-- URL list (hidden until connected) -->
         <div id="deepseekUrls" class="url-area hidden">

@@ -37,14 +37,11 @@ function setConnected() {
   document.getElementById("deepseekUrls").classList.remove("hidden");
   document.getElementById("btnSyncAll").disabled = false;
   document.getElementById("btnSyncSelected").disabled = false;
+  document.getElementById("pvDeepSeek").className = "pv-dot dot-on";
   setBridgeStatus("connected");
 }
 
 function addAccount(provider) {
-  if (provider === 'gemini') {
-    openCdpModal();
-    return;
-  }
   currentProvider = provider;
   document.getElementById("modalTitle").textContent = "Подключить аккаунт";
   document.getElementById("modalLabel").textContent = "URL DeepSeek:";
@@ -90,198 +87,88 @@ function submitAccount() {
   }
 }
 
-// ── CDP Modal for Gemini ──
-
-function openCdpModal() {
-  document.getElementById("cdpModal").classList.remove("hidden");
-  document.getElementById("cdpStatus").textContent = "";
-  document.getElementById("cdpStatus").className = "cdp-status";
-  document.getElementById("btnCdpCheck").disabled = false;
-  document.getElementById("btnCdpCheck").textContent = "Проверить подключение";
-}
-
-function closeCdpModal() {
-  document.getElementById("cdpModal").classList.add("hidden");
-}
-
-function checkGeminiCDP() {
-  const status = document.getElementById("cdpStatus");
-  status.textContent = "⏳ Проверка CDP...";
-  status.className = "cdp-status waiting";
-
-  if (window.pywebview) {
-    window.pywebview.api.check_cdp_status().then(
-      function(state) {
-        if (state === "connected") {
-          status.textContent = "✅ Подключено";
-          status.className = "cdp-status ok";
-          setGeminiConnected();
-          setTimeout(closeCdpModal, 1500);
-        } else if (state === "connecting") {
-          status.textContent = "⏳ Подключаюсь к Gemini...";
-          status.className = "cdp-status waiting";
-        } else if (state === "cdp_ready") {
-          status.textContent = "⏳ Подключаюсь к Gemini...";
-          status.className = "cdp-status waiting";
-          window.pywebview.api.start_gemini_connect();
-        } else {
-          status.textContent = "⏳ Chrome ещё не готов...";
-          status.className = "cdp-status waiting";
-        }
-      },
-      function(err) {
-        status.textContent = "❌ Ошибка: " + (err || "CDP не отвечает");
-        status.className = "cdp-status error";
-      }
-    );
-  }
-}
-
-function launchChromeCDP() {
-  window._connect_triggered = false;
-  const btn = document.getElementById("btnLaunchChrome");
-  const status = document.getElementById("cdpStatus");
-  btn.disabled = true;
-  btn.textContent = "Запуск...";
-  status.textContent = "⏳ Запуск Chrome...";
-  status.className = "cdp-status waiting";
-
-  if (window.pywebview) {
-    window.pywebview.api.launch_chrome().then(
-      function(resp) {
-        status.textContent = "✅ Chrome запущен, ждём CDP...";
-        let tries = 0;
-        let delay = 800;
-        const timer = setInterval(function() {
-          tries++;
-          setTimeout(function() {
-            if (document.getElementById("cdpModal").classList.contains("hidden")) {
-              clearInterval(timer);
-              return;
-            }
-            window.pywebview.api.check_cdp_status().then(
-              function(state) {
-                if (state === "connected") {
-                  status.textContent = "✅ Подключено";
-                  status.className = "cdp-status ok";
-                  clearInterval(timer);
-                  btn.disabled = false;
-                  btn.textContent = "🚀 Запустить Chrome";
-                  setGeminiConnected();
-                  setTimeout(closeCdpModal, 1500);
-                } else if (state === "connecting") {
-                  status.textContent = "⏳ Подключаюсь к Gemini...";
-                  status.className = "cdp-status waiting";
-                } else if (state === "cdp_ready") {
-                  status.textContent = "⏳ Подключаюсь к Gemini...";
-                  status.className = "cdp-status waiting";
-                  if (!window._connect_triggered) {
-                    window._connect_triggered = true;
-                    window.pywebview.api.start_gemini_connect();
-                  }
-                } else if (tries >= 10) {
-                  status.textContent = "⏳ Таймаут — попробуйте Проверить подключение";
-                  status.className = "cdp-status waiting";
-                  clearInterval(timer);
-                  btn.disabled = false;
-                  btn.textContent = "🚀 Запустить Chrome";
-                }
-              },
-              function(err) {
-                if (tries >= 10) {
-                  status.textContent = "❌ Ошибка CDP: " + (err || "таймаут");
-                  status.className = "cdp-status error";
-                  clearInterval(timer);
-                  btn.disabled = false;
-                  btn.textContent = "🚀 Запустить Chrome";
-                }
-              }
-            );
-          }, Math.random() * 200);
-          delay = Math.min(delay * 1.2, 2000);
-        }, delay);
-      },
-      function(err) {
-        status.textContent = "❌ Ошибка: " + (err || "Chrome не найден");
-        status.className = "cdp-status error";
-        btn.disabled = false;
-        btn.textContent = "🚀 Запустить Chrome";
-      }
-    );
-  }
-}
-
 // ── Stop / Cancel ──
 
-let exportStateDS = "idle"; // idle | running | cancelling
-let exportStateGM = "idle";
-let exportStateQW = "idle";
-
-function cancelDeepSeek() {
-  if (exportStateDS !== "running") return;
-  exportStateDS = "cancelling";
-  document.getElementById("btnStopDS").disabled = true;
-  document.getElementById("btnStopDS").textContent = "⏹ Останавливаю...";
-  Promise.resolve(
-    window.pywebview?.api?.cancel_deepseek_export?.()
-  ).finally(() => {
-    log("DeepSeek cancel requested");
-    hideStopButtonDS();
+function cancelAll() {
+  document.querySelectorAll('.danger').forEach(function(b) {
+    b.disabled = true; b.textContent = "⏹ Останавливаю...";
+  });
+  if (window.pywebview) {
+    window.pywebview.api.cancel_all()
+      .then(function() { resetStopButtons(); })
+      .catch(function() { resetStopButtons(); });
+  }
+}
+function resetStopButtons() {
+  document.querySelectorAll('.danger').forEach(function(b) {
+    b.disabled = false; b.textContent = "⏹ Остановить";
   });
 }
 
-function cancelGemini() {
-  if (exportStateGM !== "running") return;
-  exportStateGM = "cancelling";
-  document.getElementById("btnStopGM").disabled = true;
-  document.getElementById("btnStopGM").textContent = "⏹ Останавливаю...";
-  Promise.resolve(
-    window.pywebview?.api?.cancel_gemini_export?.()
-  ).finally(() => {
-    log("Gemini cancel requested");
-    hideStopButtonGM();
-  });
+// ── CDP Bar ──
+
+function refreshCdpStatus() {
+  if (window.pywebview) {
+    window.pywebview.api.get_cdp_status().then(function(state) {
+      updateCdpBar(state);
+    });
+  }
 }
 
-function showStopButtonDS() {
-  exportStateDS = "running";
-  const btn = document.getElementById("btnStopDS");
-  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
-}
-function hideStopButtonDS() {
-  exportStateDS = "idle";
-  document.getElementById("btnStopDS").classList.add("hidden");
-}
-function showStopButtonGM() {
-  exportStateGM = "running";
-  const btn = document.getElementById("btnStopGM");
-  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
-}
-function hideStopButtonGM() {
-  exportStateGM = "idle";
-  document.getElementById("btnStopGM").classList.add("hidden");
+function updateCdpBar(state) {
+  var indicator = document.getElementById("cdpIndicator");
+  var btnStart = document.getElementById("btnStartCdp");
+  var btnStop = document.getElementById("btnStopCdp");
+  var btnRestart = document.getElementById("btnRestartCdp");
+  if (state === "running") {
+    indicator.innerHTML = '🔗 CDP: <span class="status-dot" style="color:#0ea56a;">●</span> запущен';
+    btnStart.classList.add("hidden");
+    btnStop.classList.remove("hidden");
+    btnRestart.classList.remove("hidden");
+    btnStart.disabled = false;
+    btnStart.textContent = "▶ Запустить Chrome";
+  } else if (state === "starting") {
+    indicator.innerHTML = '🔗 CDP: <span class="status-dot" style="color:#f0b400;">◐</span> запускается...';
+    btnStart.disabled = true;
+    btnStart.textContent = "Запуск...";
+    btnStart.classList.remove("hidden");
+    btnStop.classList.add("hidden");
+    btnRestart.classList.add("hidden");
+  } else {
+    indicator.innerHTML = '🔗 CDP: <span class="status-dot" style="color:#4a5568;">○</span> не запущен';
+    btnStart.disabled = false;
+    btnStart.textContent = "▶ Запустить Chrome";
+    btnStart.classList.remove("hidden");
+    btnStop.classList.add("hidden");
+    btnRestart.classList.add("hidden");
+  }
 }
 
-function cancelQwen() {
-  if (exportStateQW !== "running") return;
-  exportStateQW = "cancelling";
-  document.getElementById("btnStopQW").disabled = true;
-  document.getElementById("btnStopQW").textContent = "⏹ Останавливаю...";
-  Promise.resolve(
-    window.pywebview?.api?.cancel_qwen_export?.()
-  ).finally(() => {
-    log("Qwen cancel requested");
-    hideStopButtonQW();
-  });
+function startCdp() {
+  log("starting Chrome CDP...");
+  refreshCdpStatus();
+  if (window.pywebview) {
+    window.pywebview.api.launch_chrome().then(
+      function() { refreshCdpStatus(); },
+      function(err) { log("CDP start failed: " + err); refreshCdpStatus(); }
+    );
+  }
 }
-function showStopButtonQW() {
-  exportStateQW = "running";
-  const btn = document.getElementById("btnStopQW");
-  btn.classList.remove("hidden"); btn.disabled = false; btn.textContent = "⏹ Остановить";
+
+function stopCdp() {
+  log("stopping Chrome...");
+  if (window.pywebview) {
+    window.pywebview.api.close_chrome().then(
+      function() { refreshCdpStatus(); },
+      function(err) { log("CDP stop failed: " + err); }
+    );
+  }
 }
-function hideStopButtonQW() {
-  exportStateQW = "idle";
-  document.getElementById("btnStopQW").classList.add("hidden");
+
+function restartCdp() {
+  log("restarting Chrome CDP...");
+  stopCdp();
+  setTimeout(startCdp, 2000);
 }
 
 // ── Sync ──
@@ -311,12 +198,9 @@ function getActiveUrl() {
 function _runSync(urls, btn) {
   btn.disabled = true;
   btn.textContent = "Exporting...";
-  showStopButtonDS();
-
   if (window.pywebview) {
     window.pywebview.api.sync_provider(JSON.stringify(urls)).then(
       function() {
-        hideStopButtonDS();
         btn.disabled = false;
         btn.textContent = btn.id === "btnSyncAll"
           ? "Синхронизировать DeepSeek"
@@ -325,7 +209,6 @@ function _runSync(urls, btn) {
         setBridgeStatus("ready");
       },
       function(err) {
-        hideStopButtonDS();
         btn.disabled = false;
         btn.textContent = btn.id === "btnSyncAll"
           ? "Синхронизировать DeepSeek"
@@ -362,12 +245,26 @@ function syncSelected() {
 }
 
 function syncAll() {
-  const el = document.getElementById("dsUrls");
-  const urls = el.value.split("\n").map(function(s) { return s.trim(); }).filter(Boolean);
-  log("sync all: " + urls.length + " urls");
+  log("sync all providers...");
   if (window.pywebview) {
-    window.pywebview.api.sync_all(JSON.stringify(urls));
+    window.pywebview.api.sync_all();
   }
+}
+
+function setSyncRunning(running) {
+  var btn = document.querySelector('.sync-all');
+  if (btn) {
+    btn.disabled = running;
+    btn.textContent = running ? "Синхронизация..." : "Синхронизировать всё";
+  }
+}
+
+function setProviderSync(provider, status) {
+  var map = { 'gemini':'Gemini', 'qwen':'Qwen', 'chatgpt':'ChatGPT', 'claude':'Claude', 'deepseek':'DeepSeek' };
+  var dot = document.getElementById('pv' + map[provider]);
+  if (!dot) return;
+  var cls = { 'idle':'dot-off', 'running':'dot-syncing', 'done':'dot-on', 'failed':'dot-failed' };
+  dot.className = 'pv-dot ' + (cls[status] || 'dot-off');
 }
 
 function reconnect() {
@@ -446,6 +343,21 @@ function setWaiting(seconds) {
 
 // ── Gemini ──
 
+function addGeminiAccount() {
+  log("connecting Gemini...");
+  if (window.pywebview) {
+    window.pywebview.api.connect_gemini().then(
+      function() {
+        log("Gemini connected");
+        setGeminiConnected();
+      },
+      function(err) {
+        log("Gemini connect failed: " + err);
+      }
+    );
+  }
+}
+
 function setGeminiConnected() {
   document.querySelector(".gemini .badge").textContent = "1 подключено";
   document.querySelector(".gemini .badge").className = "badge ok";
@@ -454,6 +366,7 @@ function setGeminiConnected() {
   document.getElementById("geminiUrls").classList.remove("hidden");
   document.getElementById("btnGeminiSyncAll").disabled = false;
   document.getElementById("btnGeminiSyncSelected").disabled = false;
+  document.getElementById("pvGemini").className = "pv-dot dot-on";
   setBridgeStatus("gemini connected");
 }
 
@@ -480,11 +393,9 @@ function getActiveGeminiUrl() {
 function _runGeminiSync(urls, btn) {
   btn.disabled = true;
   btn.textContent = "Exporting...";
-  showStopButtonGM();
   if (window.pywebview) {
     window.pywebview.api.sync_gemini(JSON.stringify(urls))
       .then(function(resp) {
-        hideStopButtonGM();
         btn.disabled = false;
         btn.textContent = btn.id === "btnGeminiSyncAll"
           ? "Синхронизировать Gemini"
@@ -497,7 +408,6 @@ function _runGeminiSync(urls, btn) {
         setBridgeStatus("ready");
       })
       .catch(function(err) {
-        hideStopButtonGM();
         btn.disabled = false;
         btn.textContent = btn.id === "btnGeminiSyncAll"
           ? "Синхронизировать Gemini"
@@ -523,9 +433,8 @@ function syncGeminiSelected() {
 }
 
 function reconnectGemini() {
-  window._connect_triggered = false;
   log("reconnect Gemini");
-  openCdpModal();
+  addGeminiAccount();
 }
 
 // ── Qwen ──
@@ -553,6 +462,7 @@ function setQwenConnected() {
   document.getElementById("qwenUrls").classList.remove("hidden");
   document.getElementById("btnQwenSyncAll").disabled = false;
   document.getElementById("btnQwenSyncSelected").disabled = false;
+  document.getElementById("pvQwen").className = "pv-dot dot-on";
   setBridgeStatus("qwen connected");
 }
 
@@ -583,26 +493,13 @@ function getActiveQwenUrl() {
 }
 
 function _runQwenSync(urls, btn) {
-  if (window._qwen_sync_busy) { log("[QWEN] sync already in progress"); return; }
-  window._qwen_sync_busy = true;
-
-  var btnAll = document.getElementById("btnQwenSyncAll");
-  var btnSel = document.getElementById("btnQwenSyncSelected");
-  btnAll.disabled = true;
-  btnSel.disabled = true;
-
   btn.textContent = "Exporting...";
-  showStopButtonQW();
   if (window.pywebview) {
     window.pywebview.api.sync_qwen(JSON.stringify(urls))
       .then(function(resp) {
-        hideStopButtonQW();
-        btnAll.disabled = false;
-        btnSel.disabled = false;
         btn.textContent = btn.id === "btnQwenSyncAll"
           ? "Синхронизировать Qwen"
           : "Синхронизировать выбранный чат";
-        window._qwen_sync_busy = false;
         if (resp && resp.ok) {
           log("[QWEN] exported: " + resp.count + " msgs → " + resp.path);
         } else {
@@ -611,13 +508,9 @@ function _runQwenSync(urls, btn) {
         setBridgeStatus("ready");
       })
       .catch(function(err) {
-        hideStopButtonQW();
-        btnAll.disabled = false;
-        btnSel.disabled = false;
         btn.textContent = btn.id === "btnQwenSyncAll"
           ? "Синхронизировать Qwen"
           : "Синхронизировать выбранный чат";
-        window._qwen_sync_busy = false;
         log("[QWEN ERROR] " + (err.message || err));
       });
   }
@@ -654,8 +547,207 @@ function pasteQwenUrl() {
   log("URL(s) pasted into Qwen list");
 }
 
+// ── ChatGPT ──
+
+function addChatGPTAccount() {
+  log("connecting ChatGPT...");
+  if (window.pywebview) {
+    window.pywebview.api.connect_chatgpt().then(
+      function() {
+        log("ChatGPT connected");
+        setChatGPTConnected();
+      },
+      function(err) {
+        log("ChatGPT connect failed: " + err);
+      }
+    );
+  }
+}
+
+function setChatGPTConnected() {
+  document.querySelector(".chatgpt .badge").textContent = "1 подключено";
+  document.querySelector(".chatgpt .badge").className = "badge ok";
+  document.getElementById("cgEmpty").style.display = "none";
+  document.getElementById("cgAccount").classList.remove("hidden");
+  document.getElementById("chatgptUrls").classList.remove("hidden");
+  document.getElementById("btnChatGPTSyncAll").disabled = false;
+  document.getElementById("btnChatGPTSyncSelected").disabled = false;
+  document.getElementById("pvChatGPT").className = "pv-dot dot-on";
+  setBridgeStatus("chatgpt connected");
+}
+
+function getActiveChatGPTUrl() {
+  const textarea = document.getElementById("cgUrls");
+  const start = textarea.selectionStart;
+  const lines = textarea.value.split("\n");
+  let pos = 0;
+  for (let i = 0; i < lines.length; i++) {
+    pos += lines[i].length + 1;
+    if (start <= pos) {
+      let url = lines[i].trim();
+      if (url) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+        return url;
+      }
+      break;
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    let url = lines[i].trim();
+    if (url) {
+      if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+      return url;
+    }
+  }
+  return "";
+}
+
+function _runChatGPTSync(urls, btn) {
+  btn.textContent = "Exporting...";
+  if (window.pywebview) {
+    window.pywebview.api.sync_chatgpt(JSON.stringify(urls))
+      .then(function(resp) {
+        btn.textContent = btn.id === "btnChatGPTSyncAll"
+          ? "Синхронизировать ChatGPT"
+          : "Синхронизировать выбранный чат";
+        if (resp && resp.ok) {
+          log("[CHATGPT] exported: " + resp.count + " msgs → " + resp.path);
+        } else {
+          log("[CHATGPT] export queued");
+        }
+        setBridgeStatus("ready");
+      })
+      .catch(function(err) {
+        btn.textContent = btn.id === "btnChatGPTSyncAll"
+          ? "Синхронизировать ChatGPT"
+          : "Синхронизировать выбранный чат";
+        log("[CHATGPT ERROR] " + (err.message || err));
+      });
+  }
+}
+
+function syncChatGPTAll() {
+  log("ChatGPT sync all: auto-discovering URLs from sidebar...");
+  _runChatGPTSync([], document.getElementById("btnChatGPTSyncAll"));
+}
+
+function syncChatGPTSelected() {
+  const url = getActiveChatGPTUrl();
+  if (!url) {
+    log("no ChatGPT URL selected");
+    return;
+  }
+  log("ChatGPT sync selected: " + url.slice(0, 50) + "...");
+  _runChatGPTSync([url], document.getElementById("btnChatGPTSyncSelected"));
+}
+
+function reconnectChatGPT() {
+  log("reconnect ChatGPT");
+  addChatGPTAccount();
+}
+
+// ── Claude ──
+
+function addClaudeAccount() {
+  log("connecting Claude...");
+  if (window.pywebview) {
+    window.pywebview.api.connect_claude().then(
+      function() {
+        log("Claude connected");
+        setClaudeConnected();
+      },
+      function(err) {
+        log("Claude connect failed: " + err);
+      }
+    );
+  }
+}
+
+function setClaudeConnected() {
+  document.querySelector(".claude .badge").textContent = "1 подключено";
+  document.querySelector(".claude .badge").className = "badge ok";
+  document.getElementById("clEmpty").style.display = "none";
+  document.getElementById("clAccount").classList.remove("hidden");
+  document.getElementById("claudeUrls").classList.remove("hidden");
+  document.getElementById("btnClaudeSyncAll").disabled = false;
+  document.getElementById("btnClaudeSyncSelected").disabled = false;
+  document.getElementById("pvClaude").className = "pv-dot dot-on";
+  setBridgeStatus("claude connected");
+}
+
+function getActiveClaudeUrl() {
+  const textarea = document.getElementById("clUrls");
+  const start = textarea.selectionStart;
+  const lines = textarea.value.split("\n");
+  let pos = 0;
+  for (let i = 0; i < lines.length; i++) {
+    pos += lines[i].length + 1;
+    if (start <= pos) {
+      let url = lines[i].trim();
+      if (url) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+        return url;
+      }
+      break;
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    let url = lines[i].trim();
+    if (url) {
+      if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://" + url;
+      return url;
+    }
+  }
+  return "";
+}
+
+function _runClaudeSync(urls, btn) {
+  btn.textContent = "Exporting...";
+  if (window.pywebview) {
+    window.pywebview.api.sync_claude(JSON.stringify(urls))
+      .then(function(resp) {
+        btn.textContent = btn.id === "btnClaudeSyncAll"
+          ? "Синхронизировать Claude"
+          : "Синхронизировать выбранный чат";
+        if (resp && resp.ok) {
+          log("[CLAUDE] exported: " + resp.count + " msgs → " + resp.path);
+        } else {
+          log("[CLAUDE] export queued");
+        }
+        setBridgeStatus("ready");
+      })
+      .catch(function(err) {
+        btn.textContent = btn.id === "btnClaudeSyncAll"
+          ? "Синхронизировать Claude"
+          : "Синхронизировать выбранный чат";
+        log("[CLAUDE ERROR] " + (err.message || err));
+      });
+  }
+}
+
+function syncClaudeAll() {
+  log("Claude sync all: auto-discovering URLs from sidebar...");
+  _runClaudeSync([], document.getElementById("btnClaudeSyncAll"));
+}
+
+function syncClaudeSelected() {
+  const url = getActiveClaudeUrl();
+  if (!url) {
+    log("no Claude URL selected");
+    return;
+  }
+  log("Claude sync selected: " + url.slice(0, 50) + "...");
+  _runClaudeSync([url], document.getElementById("btnClaudeSyncSelected"));
+}
+
+function reconnectClaude() {
+  log("reconnect Claude");
+  addClaudeAccount();
+}
+
 document.addEventListener("DOMContentLoaded", function() {
   setTimeout(fadeSplash, 2500);
+  setTimeout(refreshCdpStatus, 500);
 
   // Qwen DnD fix for pywebview — explicit event handlers for textarea
   const qw = document.getElementById("qwUrls");

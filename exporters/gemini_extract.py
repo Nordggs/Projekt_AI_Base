@@ -1,5 +1,6 @@
 import json
 import time
+import re
 
 GEMINI_EXTRACT_JS = """
 () => {
@@ -18,10 +19,30 @@ GEMINI_EXTRACT_JS = """
             text = parts.join('\\n');
         }
         if (!text) return;
+        // Strip Gemini UI labels from content
+        text = text.replace(/^(Ответ Gemini|Ваш запрос|Your query|Gemini's response)\\s*\\n*/i, '').trim();
+        if (!text) return;
         const role = el.tagName === "USER-QUERY" ? "user"
                   : el.tagName === "MESSAGE-CONTENT" ? "assistant"
                   : "assistant";
-        messages.push({ role, content: text });
+        let timestamp = null;
+        const te = el.querySelector('time, [datetime], [class*="time"], [data-timestamp]');
+        if (te) {
+            const dt = te.getAttribute('datetime') || te.getAttribute('data-timestamp') || te.getAttribute('title') || te.innerText;
+            if (dt) timestamp = dt.trim().slice(0, 19).replace('T', ' ');
+        }
+        if (!timestamp) {
+            // Fallback: scan for timestamp-like text in shallow children
+            const kids = el.children;
+            for (let i = 0; i < kids.length; i++) {
+                const t = (kids[i].innerText || '').replace(/\\s+/g, ' ').trim();
+                if (t && t.length < 30 && t.length > 5 && /^\\d/.test(t)) {
+                    timestamp = t;
+                    break;
+                }
+            }
+        }
+        messages.push({ role, content: text, timestamp });
     });
     const title = (document.title || '').replace(/\\s*[–-]\\s*Gemini.*/i, '').trim() || 'Gemini Chat';
     const chatId = (location.pathname.match(/\\/app\\/([^\\/?#]+)/) || [])[1] || '';
@@ -34,13 +55,13 @@ GEMINI_EXTRACT_JS = """
 }
 """
 
-SCROLL_BOTTOM_JS = """
-() => {
+SCROLL_JS = """
+(dy) => {
     const el = document.querySelector('cdk-virtual-scroll-viewport')
         || document.querySelector('main')
         || document.scrollingElement;
     if (!el) return false;
-    el.scrollBy(0, 1500);
+    el.scrollBy(0, dy);
     el.dispatchEvent(new Event('scroll'));
     window.dispatchEvent(new Event('scroll'));
     window.dispatchEvent(new Event('resize'));
@@ -48,32 +69,39 @@ SCROLL_BOTTOM_JS = """
 }
 """
 
+GEMINI_TITLE_JS = """
+() => {
+    const t = (document.title || '').replace(/\\s*[–-]\\s*Gemini.*/i, '').trim();
+    return t || 'Gemini Chat';
+}
+"""
+
+
 def extract_gemini_dom(page, url, log_progress=None, cancel_check=None, cancel_epoch=0) -> dict | None:
-    page.wait_for_timeout(1500)
+    # Quick check: if no message elements exist on page, bail fast
+    has_msgs = page.evaluate("""() => !!document.querySelector('message-content, model-response, user-query')""")
+    if not has_msgs:
+        return None
 
     merged, seen = [], set()
-    title, chat_id = '', ''
-    stable = 0
-    no_new_rounds = 0
-    last_msg_fingerprint = ""
-    MAX_STABLE = 6
-    MAX_NO_NEW = 10
-    MAX_ITER = 50
+    title_val, chat_id = '', ''
+    same_count = 0
+    last_len = 0
 
-    for i in range(MAX_ITER):
+    chat_id = url.rstrip("/").rsplit("/", 1)[-1]
+
+    # Phase 1: scroll UP (negative) — most chats have newest at bottom
+    for _ in range(200):
         if cancel_check and cancel_check():
             if cancel_epoch and (time.time() - cancel_epoch) < 0.3:
-                pass  # flicker guard
+                pass
             else:
                 break
 
         data = page.evaluate(GEMINI_EXTRACT_JS)
         new_count = 0
-
-        if not title:
-            title = data.get("title", "")
-        if not chat_id:
-            chat_id = data.get("chatId", "")
+        if not title_val:
+            title_val = data.get("title", "")
 
         for msg in data.get("messages", []):
             c = str(msg.get("content") or "").strip()
@@ -85,49 +113,168 @@ def extract_gemini_dom(page, url, log_progress=None, cancel_check=None, cancel_e
                 merged.append({"role": msg.get("role", "assistant"), "content": c})
                 new_count += 1
 
-        if new_count == 0:
-            stable += 1
+        if len(merged) == last_len:
+            same_count += 1
         else:
-            stable = 0
+            same_count = 0
+        last_len = len(merged)
 
-        messages = data.get("messages", [])
-        current_fp = ""
-        if messages:
-            last = messages[-1]
-            current_fp = (last.get("content") or "")[:200]
-        if current_fp == last_msg_fingerprint:
-            no_new_rounds += 1
-        else:
-            no_new_rounds = 0
-        last_msg_fingerprint = current_fp
-
-        if stable >= MAX_STABLE and i > 10:
-            break
-        if no_new_rounds >= MAX_NO_NEW and i > 10:
+        if same_count >= 8:
             break
 
-        if i % 10 == 0 and i > 0 and log_progress:
-            log_progress(f"scroll {i}/{MAX_ITER}: {len(merged)} msgs")
+        if len(merged) > 0 and len(merged) % 20 == 0 and log_progress:
+            log_progress(f"scroll UP: {len(merged)} msgs")
 
-        page.evaluate(SCROLL_BOTTOM_JS)
-        page.wait_for_timeout(1200)
-        page.evaluate("""
-            window.dispatchEvent(new Event('scroll'));
-            window.dispatchEvent(new Event('resize'));
-        """)
-        page.wait_for_timeout(300)
+        page.evaluate(SCROLL_JS, -2000)
+        page.wait_for_timeout(800)
+
+    # Phase 2: scroll DOWN (positive) as fallback (only if we found anything)
+    if merged:
+        down_stable = 0
+        for i in range(80):
+            if cancel_check and cancel_check():
+                break
+            data = page.evaluate(GEMINI_EXTRACT_JS)
+            added = 0
+            for msg in data.get("messages", []):
+                c = str(msg.get("content") or "").strip()
+                if not c:
+                    continue
+                key = c[:120]
+                if key not in seen:
+                    seen.add(key)
+                    merged.append({"role": msg.get("role", "assistant"), "content": c})
+                    added += 1
+            if added == 0:
+                down_stable += 1
+            else:
+                down_stable = 0
+            if down_stable >= 5 and i > 5:
+                break
+            if i % 10 == 0 and log_progress and added > 0:
+                log_progress(f"scroll DOWN {i}: +{added} → {len(merged)} msgs")
+            page.evaluate(SCROLL_JS, 2000)
+            page.wait_for_timeout(800)
 
     if not merged:
         return None
+
+    # Merge consecutive same-role messages (Gemini splits AI responses across DOM elements)
+    deduped = []
+    for msg in merged:
+        if deduped and deduped[-1]["role"] == msg["role"]:
+            deduped[-1]["content"] += "\n\n" + msg["content"]
+        else:
+            deduped.append({"role": msg["role"], "content": msg["content"]})
 
     return {
         "schema_version": 1,
         "source": "gemini",
         "chat_id": chat_id or "",
-        "title": title or "Gemini Chat",
+        "title": title_val or "Gemini Chat",
         "source_url": url,
-        "messages": merged,
+        "messages": deduped,
     }
+
+
+def _parse_gemini_batchexecute(text: str, chat_id: str, url: str) -> dict | None:
+    """Parse Gemini /_/Batchexecute response. Strips prefix, walks nested arrays for message-like strings."""
+    raw = text.strip()
+    # Strip )]}' prefix
+    if raw.startswith(")"):
+        idx = raw.find("\n")
+        if idx != -1:
+            raw = raw[idx + 1:]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("[[")
+        if start == -1:
+            return None
+        end = raw.rfind("]]") + 2
+        try:
+            data = json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            return None
+
+    messages = []
+    seen_texts = set()
+
+    def walk(obj, depth=0):
+        if depth > 8:
+            return
+        if isinstance(obj, str):
+            txt = obj.strip()
+            if 20 < len(txt) < 50000 and txt not in seen_texts:
+                seen_texts.add(txt)
+                role = "assistant" if len(messages) % 2 == 1 else "user"
+                messages.append({"role": role, "content": txt})
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, depth + 1)
+        elif isinstance(obj, dict):
+            for val in obj.values():
+                walk(val, depth + 1)
+
+    walk(data)
+
+    if len(messages) < 2:
+        return None
+
+    # Try to get title from page (passed via url)
+    title = f"Gemini Chat {chat_id[:8]}"
+
+    return {
+        "schema_version": 2,
+        "source": "api",
+        "chat_id": chat_id,
+        "title": title,
+        "source_url": url,
+        "messages": messages,
+    }
+
+
+def extract_gemini_via_api_intercept(page, url, log_progress=None, cancel_check=None, timeout_ms=15000):
+    """Reload page and intercept Batchexecute response with conversation data."""
+    chat_id = url.rstrip("/").rsplit("/", 1)[-1]
+    captured = {"data": None}
+
+    def on_response(response):
+        if captured["data"] is not None:
+            return
+        try:
+            path = response.url.split("?")[0]
+            if "batchexecute" not in path.lower():
+                return
+            if response.status != 200:
+                return
+            body = response.text()
+            if len(body) < 2000:
+                return
+            data = _parse_gemini_batchexecute(body, chat_id, url)
+            if data and len(data.get("messages", [])) >= 2:
+                captured["data"] = data
+                if log_progress:
+                    log_progress(f"[GEMINI] API intercept: {len(data['messages'])} msgs ({len(body)} bytes)")
+        except Exception as e:
+            if log_progress:
+                log_progress(f"[GEMINI] API intercept parse error: {e}")
+
+    page.on("response", on_response)
+    page.reload()
+
+    start = time.time()
+    while (time.time() - start) * 1000 < timeout_ms:
+        if cancel_check and cancel_check():
+            break
+        if captured["data"] is not None:
+            break
+        page.wait_for_timeout(500)
+
+    page.remove_listener("response", on_response)
+    if captured["data"] is None and log_progress:
+        log_progress("[GEMINI] API intercept: no conversation data captured")
+    return captured["data"]
 
 
 def extract_gemini_rpc(page, url) -> dict | None:
@@ -158,44 +305,7 @@ def extract_gemini_rpc(page, url) -> dict | None:
         if not result:
             return None
 
-        return _parse_rpc_response(result, chat_id, url)
-    except Exception:
-        return None
-
-
-def _parse_rpc_response(text: str, chat_id: str, url: str) -> dict | None:
-    try:
-        start = text.find('[[')
-        if start == -1:
-            return None
-        end = text.rfind(']]') + 2
-        data = json.loads(text[start:end])
-        turns = data[0] if isinstance(data[0], list) else data
-        messages = []
-        for idx, turn in enumerate(turns):
-            if not isinstance(turn, list) or len(turn) < 4:
-                continue
-            turn_data = turn[4] if len(turn) > 4 and isinstance(turn[4], list) else turn
-            if isinstance(turn_data, list) and len(turn_data) > 0:
-                content = turn_data[0]
-            else:
-                content = str(turn_data) if turn_data else ''
-            if isinstance(content, str) and len(content) < 200:
-                if not content.strip():
-                    continue
-            messages.append({'role': 'user' if idx % 2 == 0 else 'assistant', 'content': str(content)})
-
-        if not messages:
-            return None
-
-        return {
-            "schema_version": 1,
-            "source": "gemini",
-            "chat_id": chat_id,
-            "title": f"Gemini Chat {chat_id[:8]}",
-            "source_url": url,
-            "messages": messages,
-        }
+        return _parse_gemini_batchexecute(result, chat_id, url)
     except Exception:
         return None
 
@@ -222,11 +332,15 @@ def discover_gemini_sidebar_urls(page) -> list[str]:
 
 def discover_all_gemini_urls(page) -> list[str]:
     try:
+        # Open sidebar via keyboard shortcut (Ctrl+Shift+H)
+        page.keyboard.press("Control+Shift+h")
+        page.wait_for_timeout(3000)
+
         all_urls = set()
         seen_set = set()
         stable = 0
-        MAX_STABLE = 5
-        MAX_ITER = 40
+        MAX_STABLE = 8
+        MAX_ITER = 80
 
         for _ in range(MAX_ITER):
             urls = page.evaluate("""
@@ -252,13 +366,25 @@ def discover_all_gemini_urls(page) -> list[str]:
                 seen_set |= current
                 all_urls |= current
 
+            # Scroll the history container (Angular cdk-virtual-scroll / infinite-scroller)
             page.evaluate("""
                 () => {
-                    const c = document.querySelector('[class*="sidebar"], [class*="nav"], [class*="menu"], nav');
-                    if (c) c.scrollTop += 300;
+                    let el = document.querySelector('.chat-history-scroll-container');
+                    if (!el) el = document.querySelector('infinite-scroller, [class*="history"]');
+                    if (!el) {
+                        const links = document.querySelectorAll('a[href*="/app/"]');
+                        if (links.length > 0) {
+                            let p = links[links.length - 1].parentElement;
+                            while (p && p !== document.body) {
+                                if (p.scrollHeight > p.clientHeight + 5) { el = p; break; }
+                                p = p.parentElement;
+                            }
+                        }
+                    }
+                    if (el) { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); }
                 }
             """)
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(400)
 
         return list(all_urls)
     except Exception:

@@ -447,58 +447,52 @@ pre {
   cursor: default;
 }
 
-/* CDP MODAL */
-.cdp-steps {
-  margin: 10px 0;
-}
-
-.cdp-steps p {
-  margin: 8px 0 4px;
-  font-size: 13px;
-}
-
-.cdp-steps code {
-  display: block;
-  background: #0b0f17;
-  border: 1px solid #2a3345;
-  padding: 8px 10px;
-  border-radius: 6px;
+/* CDP BAR */
+.cdp-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: #0e1420;
+  border: 1px solid #1f2a3a;
+  border-radius: 10px;
+  margin-bottom: 12px;
   font-size: 12px;
-  color: #b0b8c4;
-  word-break: break-all;
-  margin: 4px 0 10px;
 }
-
-.cdp-steps a {
-  color: #2f6bff;
+.cdp-label {
+  color: #9aa4b2;
+  white-space: nowrap;
 }
-
-.cdp-steps .primary {
-  margin: 6px 0 12px;
+.status-dot {
+  margin-right: 4px;
 }
-
-.cdp-check-area {
-  margin: 14px 0;
-}
-
-.cdp-check-area .primary {
-  margin-top: 0;
-}
-
-.cdp-status {
-  margin-top: 8px;
-  font-size: 13px;
-  min-height: 20px;
-}
-
-.cdp-status.ok {
+.dot-on {
   color: #0ea56a;
 }
-
-.cdp-status.error {
-  color: #f55;
+.dot-off {
+  color: #4a5568;
 }
-
-.cdp-status.waiting {
+.cdp-providers {
+  margin-left: auto;
+  display: flex;
+  gap: 10px;
+}
+.pv-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.pv-dot {
+  font-size: 10px;
+}
+.dot-syncing {
   color: #f0b400;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.dot-failed {
+  color: #e53e3e;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }

@@ -83,7 +83,20 @@ if(!u){var kids=el.querySelectorAll(':scope>div');for(var j=0;j<kids.length;j++)
 c=u?u.textContent.trim():el.textContent.trim();}
 if(c){
   var navId=el.getAttribute('data-nav-id')||(el.closest('[data-nav-id]')?el.closest('[data-nav-id]').getAttribute('data-nav-id'):'');
-  r.messages.push({role:role,content:c,navId:navId});
+  var timestamp=null;
+  var te=el.querySelector('time,[datetime],[class*="time"],[data-timestamp]');
+  if(te){
+    var dt=te.getAttribute('datetime')||te.getAttribute('data-timestamp')||te.getAttribute('title')||te.innerText;
+    if(dt) timestamp=dt.trim().slice(0,19).replace('T',' ');
+  }
+  if(!timestamp){
+    var small=el.querySelector('span,small,[class*="ts"],[class*="time"]');
+    if(small){
+      var t=(small.innerText||'').trim();
+      if(t&&t.length<30&&/^\\d/.test(t)) timestamp=t;
+    }
+  }
+  r.messages.push({role:role,content:c,navId:navId,timestamp:timestamp});
 }});
 var id=(location.pathname.match(/\\/a\\/chat\\/s\\/([a-f0-9-]+)/)||[])[1]||'';
 return JSON.stringify({title:r.title,titleSource:r.titleSource,chatId:id,messages:r.messages,sourceUrl:location.href});
@@ -152,6 +165,14 @@ class DeepSeekExporter(Exporter):
 
         page = self._browser.page
         log = self._browser.log.add if self._browser.log else lambda _: None
+
+        # Clean old debug files before starting
+        import glob as _glob
+        for old_f in _glob.glob("raw/debug/*"):
+            try:
+                os.remove(old_f)
+            except Exception:
+                pass
 
         # ── Network Discovery v1 + Initial HTML capture ──
         seq = 0
@@ -255,7 +276,8 @@ class DeepSeekExporter(Exporter):
         log(f"[DEBUG] SPA READY = {ready}")
 
         if not ready:
-            discovery_path = f"raw/network_discovery_{'timeout'}.json"
+            os.makedirs("raw/debug", exist_ok=True)
+            discovery_path = f"raw/debug/network_discovery_{'timeout'}.json"
             with open(discovery_path, "w", encoding="utf-8") as f:
                 json.dump(captured, f, indent=2, ensure_ascii=False)
             log(f"[SUCCESS] Network discovery saved: {discovery_path}")
@@ -271,7 +293,8 @@ class DeepSeekExporter(Exporter):
             history_resp = resp_info.value
             history_body = history_resp.text()
             log(f"[DEBUG] history_messages response: status={history_resp.status} body={len(history_body)} bytes")
-            with open("raw/history_messages_response.json", "w", encoding="utf-8") as f:
+            os.makedirs("raw/debug", exist_ok=True)
+            with open("raw/debug/history_messages_response.json", "w", encoding="utf-8") as f:
                 f.write(history_body)
             try:
                 hdata = json.loads(history_body)
@@ -294,7 +317,8 @@ class DeepSeekExporter(Exporter):
         # ── Collect API Tracer payloads ──
         api_calls = page.evaluate("window.__apiPayloads") or []
         if api_calls:
-            with open("raw/api_calls_DEBUG.json", "w", encoding="utf-8") as f:
+            os.makedirs("raw/debug", exist_ok=True)
+            with open("raw/debug/api_calls_DEBUG.json", "w", encoding="utf-8") as f:
                 json.dump(api_calls, f, indent=2, ensure_ascii=False)
             log(f"[DEBUG] API tracer: captured {len(api_calls)} calls")
             for ac in api_calls:
@@ -481,7 +505,8 @@ class DeepSeekExporter(Exporter):
 
         log(f"[SUCCESS] Extraction complete: {len(merged)} messages")
 
-        discovery_path = f"raw/network_discovery_{chat_id[:8]}.json"
+        os.makedirs("raw/debug", exist_ok=True)
+        discovery_path = f"raw/debug/network_discovery_{chat_id[:8]}.json"
         with open(discovery_path, "w", encoding="utf-8") as f:
             json.dump(captured, f, indent=2, ensure_ascii=False)
         log(f"[SUCCESS] Network discovery saved: {discovery_path}")
