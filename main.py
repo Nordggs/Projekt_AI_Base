@@ -1419,11 +1419,11 @@ class App:
                     continue
 
                 try:
-                    record = adapter.extract_chat(chat)
-                    if record:
-                        path = self._chatgpt_writer.write(record.to_dict(), chat_order=chat_idx)
+                    model = adapter.extract_chat(chat)
+                    if model:
+                        path = self._chatgpt_writer.write(model, chat_order=chat_idx)
                         if path:
-                            n = len(record.messages)
+                            n = len(model.messages)
                             results.append({"ok": True, "path": str(path), "count": n})
                             self.log.add(f"[CHATGPT] [{chat_idx+1}/{len(chats)}] {n} msgs -> {path.name}")
                             self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] OK: {n} msgs")

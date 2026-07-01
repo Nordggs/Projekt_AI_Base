@@ -1,7 +1,7 @@
 import json
 
-from adapters.base import BaseAdapter, ChatRecord
-from adapters.normalize import normalize_messages
+from adapters.base import BaseAdapter
+from conversation.models import ConversationModel
 from exporters.chatgpt_extract import (
     ApiCapture, extract_chatgpt_pipeline, extract_chatgpt_dom, ensure_conversation_loaded,
 )
@@ -94,7 +94,7 @@ class ChatGPTAdapter(BaseAdapter):
             self.page.wait_for_timeout(2000)
         return True
 
-    def extract_chat(self, chat: dict) -> ChatRecord:
+    def extract_chat(self, chat: dict) -> ConversationModel | None:
         url = self.page.url
         model = None
 
@@ -153,14 +153,4 @@ class ChatGPTAdapter(BaseAdapter):
                 self.log("[CHATGPT] all sources failed")
             return None
 
-        return ChatRecord(
-            id=chat["id"],
-            title=model.title or chat["title"],
-            messages=normalize_messages(
-                [{"role": m.role, "content": m.content, "timestamp": m.timestamp,
-                  "message_id": m.message_id, "attachments": m.attachments}
-                 for m in model.messages]
-            ),
-            source="chatgpt",
-            url=url,
-        )
+        return model
