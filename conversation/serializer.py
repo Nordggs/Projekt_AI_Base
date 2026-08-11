@@ -1,5 +1,5 @@
 from conversation.models import (
-    ConversationModel, ConversationTree, TreeNode, Message, NodeID,
+    AttachmentNode, ConversationModel, ConversationTree, TreeNode, Message, NodeID,
 )
 
 
@@ -16,6 +16,38 @@ def model_to_dict(model: ConversationModel) -> dict:
     }
 
 
+def _att_to_dict(a: AttachmentNode) -> dict:
+    d = {"type": a.type, "mime": a.mime, "name": a.name, "meta": dict(a.meta),
+         "source": a.source, "is_partial": a.is_partial,
+         "confidence": a.confidence, "timestamp": a.timestamp}
+    if a.pointer:
+        d["pointer"] = a.pointer
+    if a.api_id:
+        d["api_id"] = a.api_id
+    if a.local:
+        d["local"] = dict(a.local)
+    if a.url:
+        d["url"] = a.url
+    return d
+
+
+def _dict_to_att(d: dict) -> AttachmentNode:
+    return AttachmentNode(
+        type=d.get("type", "file"),
+        mime=d.get("mime"),
+        name=d.get("name"),
+        meta=d.get("meta", {}),
+        local=d.get("local"),
+        source=d.get("source", "api"),
+        is_partial=d.get("is_partial", True),
+        confidence=d.get("confidence", 1.0),
+        timestamp=d.get("timestamp"),
+        pointer=d.get("pointer"),
+        api_id=d.get("api_id"),
+        url=d.get("url"),
+    )
+
+
 def _message_to_dict(m: Message) -> dict:
     d = {"role": m.role, "content": m.content}
     if m.timestamp:
@@ -23,17 +55,19 @@ def _message_to_dict(m: Message) -> dict:
     if m.message_id:
         d["message_id"] = m.message_id
     if m.attachments:
-        d["attachments"] = m.attachments
+        d["attachments"] = [_att_to_dict(a) for a in m.attachments]
     return d
 
 
 def _dict_to_message(d: dict) -> Message:
+    raw_atts = d.get("attachments", [])
+    atts = [_dict_to_att(a) if isinstance(a, dict) else a for a in raw_atts]
     return Message(
         role=d.get("role", "assistant"),
         content=d.get("content", ""),
         timestamp=d.get("timestamp"),
         message_id=d.get("message_id"),
-        attachments=d.get("attachments", []),
+        attachments=atts,
     )
 
 

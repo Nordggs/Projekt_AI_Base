@@ -1,7 +1,8 @@
 import json
 
-from adapters.base import BaseAdapter, ChatRecord
-from adapters.normalize import normalize_messages
+from adapters.base import BaseAdapter
+from conversation.irbuilder import IRBuilder, Provider
+from conversation.models import ConversationModel
 from exporters.claude_extract import extract_claude_hybrid
 
 
@@ -91,7 +92,7 @@ class ClaudeAdapter(BaseAdapter):
             self.page.wait_for_timeout(2000)
         return True
 
-    def extract_chat(self, chat: dict) -> ChatRecord:
+    def extract_chat(self, chat: dict) -> ConversationModel | None:
         url = self.page.url
         data = extract_claude_hybrid(
             self.page, url,
@@ -101,10 +102,7 @@ class ClaudeAdapter(BaseAdapter):
         if not data or not data.get("messages"):
             return None
 
-        return ChatRecord(
-            id=chat["id"],
-            title=chat["title"],
-            messages=normalize_messages(data["messages"]),
-            source="claude",
-            url=url,
-        )
+        model = IRBuilder.build(Provider.CLAUDE, data)
+        model.metadata["provider"] = "claude"
+        model.metadata["source"] = "dom"
+        return model

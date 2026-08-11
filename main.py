@@ -2,39 +2,118 @@ import json
 import os
 import queue
 import re
-import shutil
-import subprocess
+import sys
 import threading
 import time as time_module
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
 import webview
 
 from core.logger import LogBuffer
-from exporters.base import Browser
-from exporters.deepseek import DeepSeekExporter
-from exporters.gemini_extract import (
-    extract_gemini_dom,
-    extract_gemini_rpc,
-    extract_gemini_via_api_intercept,
-    discover_gemini_sidebar_urls,
-    discover_all_gemini_urls,
-)
-from exporters.qwen_extract import (
-    extract_qwen_hybrid,
-)
+from adapters.gemini import GeminiAdapter
+from adapters.deepseek import DeepSeekAdapter
 from adapters.qwen import QwenAdapter
 from adapters.chatgpt import ChatGPTAdapter
 from adapters.claude import ClaudeAdapter
 from adapters.cdp_manager import CDPManager
-from exporters.chatgpt_extract import ApiCapture, extract_chatgpt_pipeline
-from conversation.validator import validate_all as validate_conversation
-from config import CHATGPT_DIAGNOSE
-from exporters.claude_extract import extract_claude_hybrid
-from exporters.playwright_browser import BrowserPlaywright
+from conversation.enrichment import Enricher, RuntimeData, BlobEntry, TraceEntry, AnchorData
 from exporters.writer import ExportWriter
+
+
+def _resolve_ui_url():
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for candidate in (
+        os.path.join(exe_dir, "ui", "app.html"),
+        os.path.join(exe_dir, "_internal", "ui", "app.html"),
+        os.path.join(os.getcwd(), "ui", "app.html"),
+    ):
+        if os.path.isfile(candidate):
+            return "file:///" + candidate.replace("\\", "/")
+    return "ui/app.html"
+
+
+@dataclass
+class CaptureContext:
+    cdp_assets: list = field(default_factory=list)
+    runtime: RuntimeData = field(default_factory=RuntimeData)
+    anchor: AnchorData = field(default_factory=AnchorData)
+
+
+def capture_cdp_if_needed(provider_name, page, push_log=None):
+    if provider_name != "chatgpt":
+        return CaptureContext()
+    from exporters.attachment_capture import AttachmentCDPCapture as ACC
+    import time as _t
+
+    capture_cdp = ACC(page)
+    capture_cdp.start()
+
+    anchor = page.evaluate("""(() => ({ perf: performance.now(), epoch: Date.now() }))()""")
+    anchor_data = AnchorData(
+        perf_zero=anchor["perf"] / 1000,
+        epoch_zero=anchor["epoch"] / 1000,
+    )
+
+    page.evaluate("""(() => {
+        const trace = [];
+        new MutationObserver(ms => {
+            for (const m of ms) {
+                if (m.type === 'childList')
+                    for (const n of m.addedNodes)
+                        if (n.tagName === 'IMG' && n.src)
+                            trace.push({ src: n.src, t: performance.now(), kind: 'added' });
+                if (m.type === 'attributes' && m.target.tagName === 'IMG' && m.target.src)
+                    trace.push({ src: m.target.src, t: performance.now(), kind: 'attr' });
+            }
+            if (trace.length > 2000) trace.splice(0, trace.length - 2000);
+        }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+        window.__img_trace = trace;
+    })()""")
+
+    page.evaluate("""(async () => {
+        const c = document.querySelector('[data-testid="conversation-scroll"]')
+               || document.querySelector('[data-testid="conversation-turns"]')
+               || document.scrollingElement;
+        if (!c) return;
+        c.scrollTop = c.scrollHeight;
+        c.dispatchEvent(new Event('scroll'));
+        await new Promise(r => setTimeout(r, 3000));
+    })()""")
+
+    if push_log:
+        push_log("[CDP] capturing trace + blob assets from runtime...")
+    raw = page.evaluate("""(async () => {
+        const trace = (window.__img_trace || []).slice();
+        const blobs = [];
+        for (const entry of trace) {
+            if (entry.src.startsWith('blob:')) {
+                try {
+                    const r = await fetch(entry.src);
+                    const buf = await r.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let binary = '';
+                    for (let j = 0; j < bytes.length; j++)
+                        binary += String.fromCharCode(bytes[j]);
+                    blobs.push({ src: entry.src, b64: btoa(binary), ctype: r.headers.get('content-type') || 'image/png', t: entry.t });
+                } catch(e) {}
+            }
+        }
+        return { trace, blobs };
+    })()""")
+    page.evaluate("window.__img_trace = []")
+
+    capture_cdp.stop()
+
+    runtime_data = RuntimeData(
+        trace=[TraceEntry(**e) for e in raw["trace"]],
+        blobs=[BlobEntry(**b) for b in raw["blobs"]],
+    )
+    if push_log:
+        push_log(f"[CDP] trace={len(runtime_data.trace)} entries, blobs={len(runtime_data.blobs)}")
+
+    return CaptureContext(cdp_assets=capture_cdp.assets, runtime=runtime_data, anchor=anchor_data)
 
 
 MAX_LOGIN_SOFT = 600
@@ -120,6 +199,9 @@ class API:
     def sync_claude(self, urls_json):
         return self._app.sync_claude(urls_json)
 
+    def connect_deepseek(self):
+        return self._app.add_account("https://chat.deepseek.com/")
+
     def save_ui_snapshot(self, content):
         threading.Thread(
             target=self._app.save_ui_snapshot,
@@ -154,13 +236,12 @@ class App:
         self.api = API(self)
         self.window = webview.create_window(
             "AI Chat Exporter",
-            url="ui/app.html",
+            url=_resolve_ui_url(),
             js_api=self.api,
             width=1300,
             height=750,
         )
         self.log = LogBuffer()
-        self.writer = ExportWriter()
         self.pw = None
         self._auto_reconnecting = False
         self._seen_urls = set()
@@ -199,11 +280,8 @@ class App:
         self._gw_queue = queue.Queue()
         self._connect_gemini_done = threading.Event()
         self._gemini_export_active = False
-        self._gemini_writer = None
         self._gemini_connect_lock = False
         self._gemini_connect_state = "idle"  # idle | connecting | connected
-        self._gemini_broken = False
-        self._gemini_last_fail_time = 0
         self._cdp_lock = threading.Lock()
 
         # Qwen (CDP page in same browser as Gemini)
@@ -212,7 +290,6 @@ class App:
         self._qwen_connect_lock = False
         self._connect_qwen_done = threading.Event()
         self._qwen_export_active = False
-        self._qwen_writer = None
         self._qwen_session_epoch = 0
 
         # ChatGPT (CDP page in same browser as Gemini)
@@ -221,7 +298,6 @@ class App:
         self._chatgpt_connect_lock = False
         self._connect_chatgpt_done = threading.Event()
         self._chatgpt_export_active = False
-        self._chatgpt_writer = None
         self._chatgpt_session_epoch = 0
 
         # Claude (CDP page in same browser as Gemini)
@@ -230,7 +306,6 @@ class App:
         self._claude_connect_lock = False
         self._connect_claude_done = threading.Event()
         self._claude_export_active = False
-        self._claude_writer = None
         self._claude_session_epoch = 0
 
         # CDP Manager — единый Chrome для всех провайдеров
@@ -383,9 +458,10 @@ class App:
             try:
                 if cmd == "connect":       self._do_connect(arg)
                 elif cmd == "reconnect":   self._do_reconnect()
-                elif cmd == "export_batch":
+                elif cmd == "export_provider":
+                    name, urls = arg
                     try:
-                        self._do_export_batch(arg)
+                        self._export_provider(name, urls)
                     finally:
                         self._export_active = False
             except Exception as e:
@@ -412,38 +488,28 @@ class App:
 
             try:
                 if cmd == "connect_gemini":      self._do_connect_gemini(arg)
-                elif cmd == "export_gemini_batch":
+                elif cmd == "export_provider":
+                    name, urls = arg
                     try:
-                        self._do_export_gemini_batch(arg)
+                        self._export_provider(name, urls)
                     finally:
-                        self._gemini_export_active = False
+                        reset = {"gemini": "_gemini_export_active", "qwen": "_qwen_export_active",
+                                 "chatgpt": "_chatgpt_export_active", "claude": "_claude_export_active"}
+                        flag = reset.get(name)
+                        if flag:
+                            setattr(self, flag, False)
                 elif cmd == "connect_qwen":
                     with self._cdp_lock:
                         self._do_connect_qwen()
                     self._connect_qwen_done.set()
-                elif cmd == "export_qwen_batch":
-                    try:
-                        self._do_export_qwen_batch(arg)
-                    finally:
-                        self._qwen_export_active = False
                 elif cmd == "connect_chatgpt":
                     with self._cdp_lock:
                         self._do_connect_chatgpt()
                     self._connect_chatgpt_done.set()
-                elif cmd == "export_chatgpt_batch":
-                    try:
-                        self._do_export_chatgpt_batch(arg)
-                    finally:
-                        self._chatgpt_export_active = False
                 elif cmd == "connect_claude":
                     with self._cdp_lock:
                         self._do_connect_claude()
                     self._connect_claude_done.set()
-                elif cmd == "export_claude_batch":
-                    try:
-                        self._do_export_claude_batch(arg)
-                    finally:
-                        self._claude_export_active = False
             except Exception as e:
                 self.log.add(f"[ERROR] _gw_worker cmd={cmd}: {e}")
                 self._push_log(f"Gemini ERR: {e}")
@@ -546,7 +612,6 @@ class App:
 
             self.gemini_page = page
             self._gemini_connect_state = "connected"
-            self._gemini_broken = False
             self._connect_gemini_done.set()
             try:
                 self.window.evaluate_js("setGeminiConnected()")
@@ -555,7 +620,6 @@ class App:
             self.log.add("[INFO] Gemini connected via CDP")
         except Exception as e:
             self._gemini_connect_state = "idle"
-            self._gemini_last_fail_time = time_module.time()
             self.log.add(f"[ERROR] CDP attach failed: {e}")
             raise
 
@@ -566,321 +630,140 @@ class App:
         self.gemini_page = browser.contexts[0].new_page()
         return self.gemini_page
 
-    def _export_one(self, url, chat_order=0):
-        self.log.add(f"[INFO] Exporting {url[:60]}...")
-        self._check_cancel()
-
-        # scroll sidebar until target URL appears in visible DOM
+    def _gemini_nav_home(self, page):
         try:
-            mp = self._main_page()
-            if mp:
-                target_url = url.rstrip("/")
-                for _ in range(60):
-                    self._check_cancel()
-                    urls = mp.evaluate("""
-                        () => [...document.querySelectorAll('a[href*="/chat/s/"]')]
-                            .map(a => 'https://chat.deepseek.com' + a.getAttribute('href'))
-                    """)
-                    if any(target_url in (u or "") for u in (urls or [])):
-                        break
-                    mp.evaluate("""
-                        () => {
-                            const c = document.querySelector('.ds-virtual-list');
-                            if (c) c.scrollTop += 300;
-                        }
-                    """)
-                    time_module.sleep(0.2)
+            page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
         except Exception:
             pass
 
+    # ── Unified adapter + pipeline layer (replaces all per-provider batch methods) ──
+
+    def _page_for(self, name):
+        return {
+            "deepseek": self.pw.page if self.pw else None,
+            "gemini": self.gemini_page,
+            "qwen": self.qwen_page,
+            "chatgpt": self.chatgpt_page,
+            "claude": self.claude_page,
+        }.get(name)
+
+    def _adapter_for(self, name, page):
+        switch = {
+            "deepseek": lambda: DeepSeekAdapter(page, self.log, self._check_cancel),
+            "gemini": lambda: GeminiAdapter(page, self._push_log, self._check_cancel, self._cancel_version),
+            "qwen": lambda: QwenAdapter(page, self._cdp_lock, self._push_log, lambda: self._cancel_flag),
+            "chatgpt": lambda: ChatGPTAdapter(page, self._cdp_lock, self._push_log, lambda: self._cancel_flag),
+            "claude": lambda: ClaudeAdapter(page, self._cdp_lock, self._push_log, lambda: self._cancel_flag),
+        }
+        fn = switch.get(name)
+        if fn is None:
+            raise ValueError(f"Unknown adapter: {name}")
+        return fn()
+
+    def _export_provider(self, name, urls=None):
+        lock = self._locks[name]
+        if not lock.acquire(blocking=False):
+            self.log.add(f"[WARN] {name} sync BUSY")
+            self._push_log(f"{name} BUSY")
+            return
+
+        self.set_sync_state(name, "running")
+        self.log.add(f"[{name.upper()}] batch start urls={urls}")
+        writer = ExportWriter(out_dir=self._output_folders[name])
+
         try:
-            page = self.pw.page
-            page.set_default_timeout(30_000)
-
-            browser = Browser(window=None, mode="playwright", log=self.log)
-            browser._playwright_page = page
-
-            result = []
-            exporter = DeepSeekExporter(browser, url=url,
-                capture_ssr=False, capture_cache=False,
-                capture_bundles=False, capture_state=False)
-            exporter.start(lambda r: result.append(r))
-
-            data = result[0] if result else None
-            if data and "error" not in data:
-                path = self.writer.write(data, chat_order=chat_order)
-                n = len(data.get("messages", []))
-                self.log.add(f"[SUCCESS] {n} msgs → {path.name}")
-                self._push_log(f"OK: {n} msgs — {data.get('title', '?')}")
-                self.log_ui_event(f"export {n} msgs — {path.name}")
-                return True
+            if urls:
+                chats = [{"url": u} for u in dict.fromkeys(urls)]
+            elif name == "deepseek":
+                urls = self._discover_sidebar_urls()
+                chats = [{"url": u} for u in urls]
             else:
-                err = (data or {}).get("error", "no result")
-                self.log.add(f"[ERROR] {err}")
-                self._push_log(f"ERR: {err}")
-                return False
-        except Exception as e:
-            self.log.add(f"[ERROR] Export failed: {e}")
-            self._push_log(f"ERR: {e}")
-            return False
+                page = self._page_for(name)
+                adapter = self._adapter_for(name, page)
+                if not adapter.healthcheck():
+                    raise RuntimeError(f"{name} page not available")
+                chats = adapter.list_chats()
 
-    def _do_export_batch(self, urls):
-        if not self._locks["deepseek"].acquire(blocking=False):
-            self.log.add("[WARN] DeepSeek sync BUSY")
-            self._push_log("DeepSeek BUSY")
-            return
-        self.set_sync_state("deepseek", "running")
-        self.log.add(f"[DEEPSEEK] batch urls={len(urls)}")
-        urls = urls or self._discover_sidebar_urls()
-        if not urls:
-            self.log.add("[ERROR] No DeepSeek chat URLs found")
-            self._push_log("ERR: no URLs found")
-            self.set_sync_state("deepseek", "failed")
-            self._locks["deepseek"].release()
-            return
+            if not chats:
+                raise RuntimeError(f"No {name} chat URLs found")
 
-        self._export_active = True
-        self.writer = ExportWriter(out_dir=self._output_folders["deepseek"])
-        try:
-            ok = 0
-            for idx, url in enumerate(urls):
-                self._check_cancel()
-                if self._export_one(url, chat_order=idx):
-                    ok += 1
-            self.set_sync_state("deepseek", "done")
-            self.log.add(f"[INFO] Batch done: {ok}/{len(urls)} OK")
-            self._push_log(f"Batch done: {ok}/{len(urls)} OK")
-            try:
-                self.window.evaluate_js("copyLogContent()")
-            except Exception:
-                pass
-        except Cancelled:
-            self.set_sync_state("deepseek", "failed")
-            self.log.add("[INFO] Batch cancelled by user")
-            self._push_log("⏹ Sync cancelled")
-        finally:
-            self._cancel_flag = False
-            self._cancel_version = 0
-            self._export_active = False
-            self._locks["deepseek"].release()
-
-    # ── Gemini export (isolated single-owner) ──
-
-    def _export_gemini(self, url, chat_order=0):
-        self.log.add(f"[INFO] Exporting Gemini {url[:60]}...")
-        self._check_cancel()
-
-        try:
-            page = self._ensure_gemini_page()
-
-            # Open sidebar via keyboard shortcut if not already visible
-            page.keyboard.press("Control+Shift+h")
-            page.wait_for_timeout(2000)
-
-            # Click chat in sidebar (Gemini SPA doesn't support deep-link goto)
-            target_url = url.rstrip("/")
-            self.log.add("[INFO] Finding chat in sidebar...")
-            found = False
-            for _ in range(60):
-                self._check_cancel()
-                # Check if already on the correct page
-                current = page.evaluate("location.href.replace(/\\/+$/, '')")
-                if current == target_url:
-                    found = True
-                    break
-                # Try clicking the matching sidebar link
-                clicked = page.evaluate("""(u) => {
-                    const links = document.querySelectorAll('a[href*="/app/"]');
-                    for (const a of links) {
-                        let h = a.getAttribute('href');
-                        if (!h) continue;
-                        if (h.startsWith('/')) h = 'https://gemini.google.com' + h;
-                        if (h.replace(/\\/+$/, '') === u) {
-                            a.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""", target_url)
-                if clicked:
-                    # Wait for URL to update
-                    try:
-                        page.wait_for_function("(u) => location.href.replace(/\\/+$/, '') === u", target_url, timeout=10000)
-                        page.wait_for_timeout(1000)
-                        found = True
-                        break
-                    except Exception:
-                        pass
-                # Scroll sidebar to find more links
-                page.evaluate("""() => {
-                    let el = document.querySelector('.chat-history-scroll-container');
-                    if (!el) el = document.querySelector('infinite-scroller, [class*="history"]');
-                    if (!el) {
-                        const links = document.querySelectorAll('a[href*="/app/"]');
-                        if (links.length > 0) {
-                            let p = links[0].parentElement;
-                            while (p && p !== document.body) {
-                                if (p.scrollHeight > p.clientHeight) { el = p; break; }
-                                p = p.parentElement;
-                            }
-                        }
-                    }
-                    if (!el) el = document.querySelector('nav');
-                    if (el) el.scrollTop += 400;
-                }""")
-                page.wait_for_timeout(300)
-            if not found:
-                self.log.add(f"[ERROR] Gemini chat {url[:40]} not found in sidebar")
-                self._push_log("Gemini ERR: chat not found")
-                return None
-
-            page.wait_for_timeout(2000)
-            self.log.add(f"[INFO] Gemini chat loaded: {page.evaluate('location.href')[:60]}")
-
-            # Phase 1: RPC via JS fetch (fast, no page reload)
-            source_label = "dom"
-            data = extract_gemini_rpc(page, url)
-            if data:
-                source_label = "rpc"
-                self.log.add(f"[GEMINI] RPC: {len(data['messages'])} msgs")
-            else:
-                self.log.add("[INFO] RPC failed, using DOM extraction")
-
-            # Phase 2: DOM scroll (improved, scrolls both directions)
-            if not data:
-                for retry in range(2):
-                    self.log.add(f"[INFO] DOM extraction (scroll) attempt {retry + 1}")
-                    try:
-                        data = extract_gemini_dom(page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_flag, cancel_epoch=self._cancel_version)
-                    except Exception as e:
-                        self.log.add(f"[GEMINI][EXTRACT][FATAL] {e}")
-                        data = None
-                    if data and data.get("messages"):
-                        break
-                    if retry == 0:
-                        self.log.add("[INFO] DOM returned 0 msgs, trying sidebar click again...")
-                        try:
-                            page.evaluate("""(u) => {
-                                const links = document.querySelectorAll('a[href*="/app/"]');
-                                for (const a of links) {
-                                    let h = a.getAttribute('href');
-                                    if (!h) continue;
-                                    if (h.startsWith('/')) h = 'https://gemini.google.com' + h;
-                                    if (h.replace(/\\/+$/, '') === u) { a.click(); return true; }
-                                }
-                                return false;
-                            }""", target_url)
-                            page.wait_for_timeout(3000)
-                        except Exception:
-                            pass
-
-            if not data:
-                self.log.add("[ERROR] Gemini extraction returned no data")
-                self._push_log("Gemini ERR: no data")
-                # Navigate back to home page for next chat
-                try:
-                    page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                return None
-
-            if not data.get("messages"):
-                self.log.add("[ERROR] Gemini extraction returned 0 messages, skipping write")
-                self._push_log("Gemini ERR: 0 messages")
-                try:
-                    page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                return None
-
-            path = self._gemini_writer.write(data, chat_order=chat_order)
-            if not path:
-                self.log.add("[GEMINI][SKIP] writer returned None, no file created")
-                self._push_log("Gemini ERR: write failed")
-                try:
-                    page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                return None
-
-            n = len(data.get("messages", []))
-            self.log.add(f"[SUCCESS] Gemini {n} msgs ({source_label}) → {path.name}")
-            self._push_log(f"Gemini OK: {n} msgs — {data.get('title', '?')}")
-
-            # Navigate back to main page for next chat
-            try:
-                page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=15000)
-            except Exception:
-                pass
-            return {"ok": True, "path": str(path), "count": n}
-
-        except Exception as e:
-            self.log.add(f"[ERROR] Gemini export failed: {e}")
-            self._push_log(f"Gemini ERR: {e}")
-            return None
-
-    def _do_export_gemini_batch(self, urls):
-        if not self._locks["gemini"].acquire(blocking=False):
-            self.log.add("[WARN] Gemini sync BUSY")
-            self._push_log("Gemini BUSY")
-            return
-        self.set_sync_state("gemini", "running")
-        self.log.add(f"[GEMINI] batch start user_urls={urls}")
-        urls = urls or discover_all_gemini_urls(self.gemini_page)
-        if not urls:
-            self.log.add("[ERROR] No Gemini chat URLs found")
-            self._push_log("Gemini ERR: no URLs found")
-            self.set_sync_state("gemini", "failed")
-            self._locks["gemini"].release()
-            return
-
-        self._gemini_export_active = True
-        self._gemini_writer = ExportWriter(out_dir=self._output_folders["gemini"])
-
-        try:
+            self.log.add(f"[{name.upper()}] batch: {len(chats)} chats")
             results = []
-            for idx, url in enumerate(urls, 1):
-                self._check_cancel()
 
-                if self._gemini_broken:
-                    break
+            for idx, chat in enumerate(chats):
+                self._check_cancel()
 
                 if not _check_cdp_alive():
-                    self._gemini_broken = True
-                    self._push_log("Gemini ERR: CDP disconnected — batch aborted")
+                    self._push_log(f"{name} ERR: CDP disconnected")
                     break
 
-                self.log.add(f"[GEMINI] [{idx}/{len(urls)}] exporting {url[:40]}")
-                self._push_log(f"Gemini [{idx}/{len(urls)}]...")
-                r = self._export_gemini(url, chat_order=idx - 1)
-                if r:
-                    results.append(r)
+                title = chat.get("title", "")[:40] or chat.get("url", "")[:40]
+                self.log.add(f"[{name.upper()}] [{idx+1}/{len(chats)}] {title}")
+                self._push_log(f"{name} [{idx+1}/{len(chats)}] {title}")
+
+                page = self._page_for(name)
+                if page is None:
+                    self._push_log(f"{name} ERR: page lost")
+                    break
+
+                adapter = self._adapter_for(name, page)
+                if not adapter.healthcheck():
+                    self._push_log(f"{name} ERR: page not available")
+                    break
+
+                ok = adapter.open_chat(chat)
+                if not ok:
+                    self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: not found")
+                    continue
+
+                model = adapter.extract_chat(chat)
+                if not model:
+                    self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: no data")
+                    continue
+
+                ctx = capture_cdp_if_needed(name, page, self._push_log)
+                model, enrich_stats = Enricher.enrich(
+                    model, ctx.cdp_assets, ctx.runtime, ctx.anchor,
+                    log_func=self._push_log,
+                )
+                if ctx.cdp_assets or ctx.runtime.blobs:
+                    writer.flush_media(model)
+                    self.log.add(f"[{name.upper()}] enrich: cdp={enrich_stats.cdp_strict + enrich_stats.cdp_temporal} runtime={enrich_stats.runtime} partial={enrich_stats.partial}")
+
+                path = writer.write(model, chat_order=idx)
+                if path:
+                    n = len(model.messages)
+                    results.append({"ok": True, "path": str(path), "count": n})
+                    self.log.add(f"[{name.upper()}] [{idx+1}/{len(chats)}] {n} msgs -> {path.name}")
+                    self._push_log(f"{name} [{idx+1}/{len(chats)}] OK: {n} msgs")
                 else:
-                    self.log.add(f"[GEMINI] export returned None for {url[:60]}")
-                    if not _check_cdp_alive():
-                        self._gemini_broken = True
-                        self._push_log("Gemini ERR: CDP lost — batch aborted")
-                        break
+                    self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: write failed")
 
             total = sum(r["count"] for r in results) if results else 0
-            self.set_sync_state("gemini", "done")
-            self.log.add(f"[INFO] Gemini batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-            self._push_log(f"Gemini batch: {total} msgs — {len(results)}/{len(urls)}")
+            self.set_sync_state(name, "done")
+            self.log.add(f"[INFO] {name} batch done: {total} msgs from {len(results)}/{len(chats)} chats")
+            self._push_log(f"{name} batch: {total} msgs — {len(results)}/{len(chats)}")
             try:
                 self.window.evaluate_js("copyLogContent()")
             except Exception:
                 pass
+
         except Cancelled:
-            self.set_sync_state("gemini", "failed")
-            self.log.add("[INFO] Gemini batch cancelled by user")
-            self._push_log("⏹ Gemini sync cancelled")
+            self.set_sync_state(name, "failed")
+            self.log.add(f"[INFO] {name} batch cancelled by user")
+            self._push_log(f"⏹ {name} sync cancelled")
+        except Exception as e:
+            self.set_sync_state(name, "failed")
+            self.log.add(f"[ERROR] {name}: {e}")
+            self._push_log(f"{name} ERR: {e}")
         finally:
-            self._gemini_export_active = False
             self._cancel_flag = False
             self._cancel_version = 0
-            self._locks["gemini"].release()
+            lock.release()
+
 
     # ── Qwen (CDP page in same browser as Gemini) ──
+
 
     def _do_connect_qwen(self):
         self.log.add("[INFO] Connecting to Qwen via CDP...")
@@ -938,92 +821,6 @@ class App:
             self._push_log("Qwen page lost — reconnect required")
             return False
 
-    def _export_qwen(self, url, epoch=0, chat_order=0):
-        if epoch and self._qwen_session_epoch != epoch:
-            self.log.add(f"[EXPORT][RACE] epoch_mismatch expected={epoch} current={self._qwen_session_epoch}")
-            return None
-
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-
-        chat_id = url.rstrip("/").split("/")[-1]
-        self.log.add(f"[INFO] Exporting Qwen {url[:60]}...")
-        self._check_cancel()
-
-        try:
-            # Load chat list (sidebar)
-            with self._cdp_lock:
-                try:
-                    total = self._load_qwen_sidebar()
-                except Exception:
-                    pass
-                current = self.qwen_page.url
-                if "/auth" in current or "/login" in current:
-                    self.log.add("[WARN] Qwen redirected to auth page, need re-login")
-                    self._push_log("Qwen ERR: session expired — re-login required")
-                    return None
-
-            if epoch and self._qwen_session_epoch != epoch:
-                self.log.add(f"[EXPORT][RACE] epoch_mismatch_after_goto expected={epoch} current={self._qwen_session_epoch}")
-                return None
-
-            total = self.qwen_page.evaluate("document.querySelectorAll('div.chat-item-drag').length")
-            self.log.add(f"[QWEN] sidebar: {total} items, searching for {chat_id[:12]}")
-            self._push_log(f"Qwen search: {chat_id[:12]}")
-
-            found = False
-            for i in range(total):
-                self._check_cancel()
-                if epoch and self._qwen_session_epoch != epoch:
-                    return None
-
-                with self._cdp_lock:
-                    self._click_qwen_chat(i)
-                    self.qwen_page.wait_for_timeout(2000)
-
-                if chat_id in self.qwen_page.url:
-                    found = True
-                    with self._cdp_lock:
-                        self.pw_call(self.qwen_page.wait_for_function, """() => {
-                            const msgs = document.querySelectorAll('[class*="message"]');
-                            return msgs.length > 0 && location.href.includes('/c/');
-                        }""", timeout=30)
-                        self.qwen_page.wait_for_timeout(500)
-                    self.log.add(f"[QWEN] found chat {chat_id[:12]} at index {i}")
-                    break
-
-            if not found:
-                self.log.add(f"[ERROR] Qwen chat {chat_id[:12]} not found in sidebar")
-                self._push_log("Qwen ERR: chat not found in sidebar")
-                return None
-
-            data = extract_qwen_hybrid(self.qwen_page, url, log_progress=self._push_log, cancel_check=lambda: self._cancel_flag, cancel_epoch=self._cancel_version)
-
-            if not data:
-                self.log.add("[ERROR] Qwen extraction returned no data")
-                self._push_log("ERR: Qwen no data")
-                return None
-
-            if not data.get("messages"):
-                self.log.add("[ERROR] Qwen extraction returned 0 messages, skipping write")
-                self._push_log("Qwen ERR: 0 messages")
-                return None
-
-            path = self._qwen_writer.write(data, chat_order=chat_order)
-            if not path:
-                self._push_log("Qwen ERR: write failed")
-                return None
-
-            n = len(data.get("messages", []))
-            self.log.add(f"[SUCCESS] Qwen {n} msgs → {path.name}")
-            self._push_log(f"Qwen OK: {n} msgs — {data.get('title', '?')}")
-            return {"ok": True, "path": str(path), "count": n}
-
-        except Exception as e:
-            self.log.add(f"[ERROR] Qwen export failed: {e}")
-            self._push_log(f"Qwen ERR: {e}")
-            return None
-
     def add_qwen_account(self):
         if self._qwen_connect_lock:
             return "BUSY"
@@ -1050,7 +847,7 @@ class App:
             raise RuntimeError("Qwen export already in progress")
         urls = json.loads(urls_json)
         self.log.add(f"[INFO] Enqueuing Qwen batch export ({len(urls)} urls)")
-        self._gw_queue.put(("export_qwen_batch", urls))
+        self._gw_queue.put(("export_provider", ("qwen", urls)))
         return "STARTED"
 
     def reconnect_qwen(self):
@@ -1063,127 +860,6 @@ class App:
             self.qwen_page = None
         self._qwen_connected = False
         self.add_qwen_account()
-
-    def _do_export_qwen_batch(self, urls):
-        if not self._locks["qwen"].acquire(blocking=False):
-            self.log.add("[WARN] Qwen sync BUSY")
-            self._push_log("Qwen BUSY")
-            return
-        self.set_sync_state("qwen", "running")
-        self.log.add(f"[QWEN] batch start user_urls={urls}")
-        batch_epoch = self._qwen_session_epoch
-        self.log.add(f"[BATCH] start epoch={batch_epoch} page_url={self.qwen_page.url}")
-
-        self._qwen_export_active = True
-        self._qwen_writer = ExportWriter(out_dir=self._output_folders["qwen"])
-
-        try:
-            # ── Sync Selected: user-provided URLs ──
-            if urls:
-                urls = list(dict.fromkeys(urls))
-                if len(urls) == 1:
-                    self._push_log("Qwen single-export mode: break on first success")
-
-                results = []
-                for idx, url in enumerate(urls, 1):
-                    self._check_cancel()
-                    if self._qwen_session_epoch != batch_epoch:
-                        self.log.add(f"[BATCH][RACE] epoch_mismatch expected={batch_epoch} current={self._qwen_session_epoch}")
-                        self._push_log("Qwen ERR: session changed")
-                        break
-                    if not _check_cdp_alive():
-                        self.log.add("[WARN] CDP not available, stopping batch")
-                        self._push_log("Qwen ERR: CDP lost")
-                        break
-
-                    self.log.add(f"[QWEN] [{idx}/{len(urls)}] exporting {url[:40]}")
-                    self._push_log(f"Qwen [{idx}/{len(urls)}]...")
-                    r = self._export_qwen(url, epoch=batch_epoch, chat_order=idx - 1)
-                    if r:
-                        results.append(r)
-                        if len(urls) == 1:
-                            self.log.add("[QWEN] single-export success, breaking")
-                            break
-                    else:
-                        self.log.add(f"[QWEN] export returned None for {url[:60]}")
-
-                total = sum(r["count"] for r in results) if results else 0
-                self.set_sync_state("qwen", "done")
-                self.log.add(f"[INFO] Qwen batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-                self._push_log(f"Qwen batch: {total} msgs — {len(results)}/{len(urls)}")
-                return
-
-            # ── Sync All: QwenAdapter path ──
-            adapter = QwenAdapter(
-                self.qwen_page, self._cdp_lock,
-                self._push_log,
-                lambda: self._cancel_flag,
-            )
-            if not adapter.healthcheck():
-                self.log.add("[WARN] Qwen adapter healthcheck failed")
-                self._push_log("Qwen ERR: page not available")
-                return
-
-            chats = adapter.list_chats()
-            self.log.add(f"[QWEN] sidebar: {len(chats)} chats")
-            self._push_log(f"Qwen sidebar: {len(chats)} chats")
-
-            if not chats:
-                self.log.add("[ERROR] No Qwen chats found in sidebar")
-                self._push_log("Qwen ERR: no chats in sidebar")
-                return
-
-            results = []
-
-            for chat_idx, chat in enumerate(chats):
-                self._check_cancel()
-                if self._qwen_session_epoch != batch_epoch:
-                    self.log.add(f"[BATCH][RACE] epoch_mismatch expected={batch_epoch} current={self._qwen_session_epoch}")
-                    self._push_log("Qwen ERR: session changed")
-                    break
-                if not _check_cdp_alive():
-                    self.log.add("[WARN] CDP not available, stopping batch")
-                    self._push_log("Qwen ERR: CDP lost")
-                    break
-
-                self._push_log(f"Qwen [{chat_idx+1}/{len(chats)}] {chat['title'][:40]}")
-                ok = adapter.open_chat(chat)
-                if not ok:
-                    self._push_log(f"Qwen [{chat_idx+1}/{len(chats)}] ERR: not found")
-                    continue
-
-                record = adapter.extract_chat(chat)
-                if record:
-                    path = self._qwen_writer.write(record.to_dict(), chat_order=chat_idx)
-                    if path:
-                        n = len(record.messages)
-                        results.append({"ok": True, "path": str(path), "count": n})
-                        self.log.add(f"[QWEN] [{chat_idx+1}/{len(chats)}] {n} msgs -> {path.name}")
-                        self._push_log(f"Qwen [{chat_idx+1}/{len(chats)}] OK: {n} msgs")
-                    else:
-                        self._push_log(f"Qwen [{chat_idx+1}/{len(chats)}] ERR: write failed")
-                else:
-                    self._push_log(f"Qwen [{chat_idx+1}/{len(chats)}] ERR: no data")
-
-            total_msgs = sum(r["count"] for r in results) if results else 0
-            self.set_sync_state("qwen", "done")
-            self.log.add(f"[INFO] Qwen batch done: {total_msgs} msgs from {len(results)}/{len(chats)} chats")
-            self._push_log(f"Qwen batch: {total_msgs} msgs — {len(results)}/{len(chats)}")
-
-            try:
-                self.window.evaluate_js("copyLogContent()")
-            except Exception:
-                pass
-
-        except Cancelled:
-            self.set_sync_state("qwen", "failed")
-            self.log.add("[INFO] Qwen batch cancelled by user")
-            self._push_log("⏹ Qwen sync cancelled")
-        finally:
-            self._qwen_export_active = False
-            self._cancel_flag = False
-            self._cancel_version = 0
-            self._locks["qwen"].release()
 
     # ── ChatGPT (CDP page in same browser as Gemini) ──
 
@@ -1261,7 +937,7 @@ class App:
             raise RuntimeError("ChatGPT export already in progress")
         urls = json.loads(urls_json)
         self.log.add(f"[INFO] Enqueuing ChatGPT batch export ({len(urls)} urls)")
-        self._gw_queue.put(("export_chatgpt_batch", urls))
+        self._gw_queue.put(("export_provider", ("chatgpt", urls)))
         return "STARTED"
 
     def reconnect_chatgpt(self):
@@ -1274,186 +950,6 @@ class App:
             self.chatgpt_page = None
         self._chatgpt_connected = False
         self.add_chatgpt_account()
-
-    def _export_chatgpt(self, url, epoch=0, chat_order=0):
-        if epoch and self._chatgpt_session_epoch != epoch:
-            self.log.add(f"[EXPORT][RACE] epoch_mismatch expected={epoch} current={self._chatgpt_session_epoch}")
-            return None
-
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-
-        self.log.add(f"[INFO] Exporting ChatGPT {url[:60]}...")
-        self._check_cancel()
-
-        try:
-            # Phase 1: passive API capture during navigation
-            capture = ApiCapture(self.chatgpt_page)
-            capture.__enter__()
-            try:
-                with self._cdp_lock:
-                    self.pw_call(self.chatgpt_page.goto, url, wait_until="domcontentloaded", timeout=30)
-                    self.chatgpt_page.wait_for_timeout(2000)
-                captured = capture.wait(timeout=10)
-            finally:
-                capture.__exit__()
-
-            # Phase 2: extraction pipeline (API → NEXT_DATA → DOM)
-            model = extract_chatgpt_pipeline(
-                self.chatgpt_page, url,
-                capture_result=captured,
-                log_progress=self._push_log,
-                cancel_check=lambda: self._cancel_flag,
-            )
-
-            if not model:
-                self.log.add("[ERROR] ChatGPT extraction returned no data")
-                self._push_log("ERR: ChatGPT no data")
-                return None
-
-            if not model.messages or len(model.messages) < 2:
-                self.log.add(f"[ERROR] ChatGPT extraction returned {len(model.messages) if model.messages else 0} messages, skipping write")
-                self._push_log("ChatGPT ERR: 0 messages")
-                return None
-
-            # Phase 3: validate
-            vr = validate_conversation(model)
-            if not vr.ok:
-                self.log.add(f"[ERROR] ChatGPT validation failed: {vr.errors}")
-                self._push_log(f"ChatGPT ERR: validation failed ({len(vr.errors)} errors)")
-                return None
-            if vr.warnings:
-                for w in vr.warnings:
-                    self.log.add(f"[WARN] ChatGPT validation: {w}")
-
-            # Phase 4: write
-            path = self._chatgpt_writer.write(model, chat_order=chat_order)
-            if not path:
-                self._push_log("ChatGPT ERR: write failed")
-                return None
-
-            n = len(model.messages)
-            self.log.add(f"[SUCCESS] ChatGPT {n} msgs ({model.metadata.get('source', '?')}) → {path.name}")
-            self._push_log(f"ChatGPT OK: {n} msgs — {model.title}")
-            return {"ok": True, "path": str(path), "count": n}
-
-        except Exception as e:
-            self.log.add(f"[ERROR] ChatGPT export failed: {e}")
-            self._push_log(f"ChatGPT ERR: {e}")
-            return None
-
-    def _do_export_chatgpt_batch(self, urls):
-        if not self._locks["chatgpt"].acquire(blocking=False):
-            self.log.add("[WARN] ChatGPT sync BUSY")
-            self._push_log("ChatGPT BUSY")
-            return
-        self.set_sync_state("chatgpt", "running")
-        self.log.add(f"[CHATGPT] batch start user_urls={urls}")
-        batch_epoch = self._chatgpt_session_epoch
-
-        self._chatgpt_export_active = True
-        self._chatgpt_writer = ExportWriter(out_dir=self._output_folders["chatgpt"])
-
-        try:
-            if urls:
-                urls = list(dict.fromkeys(urls))
-                results = []
-                for idx, url in enumerate(urls, 1):
-                    self._check_cancel()
-                    if self._chatgpt_session_epoch != batch_epoch:
-                        self.log.add(f"[BATCH][RACE] epoch_mismatch")
-                        break
-                    if not _check_cdp_alive():
-                        self.log.add("[WARN] CDP not available, stopping batch")
-                        self._push_log("ChatGPT ERR: CDP lost")
-                        break
-
-                    self.log.add(f"[CHATGPT] [{idx}/{len(urls)}] exporting {url[:40]}")
-                    self._push_log(f"ChatGPT [{idx}/{len(urls)}]...")
-                    r = self._export_chatgpt(url, epoch=batch_epoch, chat_order=idx - 1)
-                    if r:
-                        results.append(r)
-                        if len(urls) == 1:
-                            break
-                    else:
-                        self.log.add(f"[CHATGPT] export returned None for {url[:60]}")
-
-                total = sum(r["count"] for r in results) if results else 0
-                self.set_sync_state("chatgpt", "done")
-                self.log.add(f"[INFO] ChatGPT batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-                self._push_log(f"ChatGPT batch: {total} msgs — {len(results)}/{len(urls)}")
-                return
-
-            adapter = ChatGPTAdapter(
-                self.chatgpt_page, self._cdp_lock,
-                self._push_log,
-                lambda: self._cancel_flag,
-            )
-            if not adapter.healthcheck():
-                self.log.add("[WARN] ChatGPT adapter healthcheck failed")
-                self._push_log("ChatGPT ERR: page not available")
-                return
-
-            chats = adapter.list_chats()
-            self.log.add(f"[CHATGPT] sidebar: {len(chats)} chats")
-            self._push_log(f"ChatGPT sidebar: {len(chats)} chats")
-
-            if not chats:
-                self.log.add("[ERROR] No ChatGPT chats found in sidebar")
-                self._push_log("ChatGPT ERR: no chats in sidebar")
-                return
-
-            results = []
-            for chat_idx, chat in enumerate(chats):
-                self._check_cancel()
-                if self._chatgpt_session_epoch != batch_epoch:
-                    break
-                if not _check_cdp_alive():
-                    self._push_log("ChatGPT ERR: CDP lost")
-                    break
-
-                self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] {chat['title'][:40]}")
-                ok = adapter.open_chat(chat)
-                if not ok:
-                    self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] ERR: not found")
-                    continue
-
-                try:
-                    model = adapter.extract_chat(chat)
-                    if model:
-                        path = self._chatgpt_writer.write(model, chat_order=chat_idx)
-                        if path:
-                            n = len(model.messages)
-                            results.append({"ok": True, "path": str(path), "count": n})
-                            self.log.add(f"[CHATGPT] [{chat_idx+1}/{len(chats)}] {n} msgs -> {path.name}")
-                            self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] OK: {n} msgs")
-                        else:
-                            self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] ERR: write failed")
-                    else:
-                        self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] ERR: no data")
-                except Exception as e:
-                    self.log.add(f"[CHATGPT] [{chat_idx+1}/{len(chats)}] error: {e}")
-                    self._push_log(f"ChatGPT [{chat_idx+1}/{len(chats)}] ERR: {e}")
-
-            total_msgs = sum(r["count"] for r in results) if results else 0
-            self.set_sync_state("chatgpt", "done")
-            self.log.add(f"[INFO] ChatGPT batch done: {total_msgs} msgs from {len(results)}/{len(chats)} chats")
-            self._push_log(f"ChatGPT batch: {total_msgs} msgs — {len(results)}/{len(chats)}")
-
-            try:
-                self.window.evaluate_js("copyLogContent()")
-            except Exception:
-                pass
-
-        except Cancelled:
-            self.set_sync_state("chatgpt", "failed")
-            self.log.add("[INFO] ChatGPT batch cancelled by user")
-            self._push_log("⏹ ChatGPT sync cancelled")
-        finally:
-            self._chatgpt_export_active = False
-            self._cancel_flag = False
-            self._cancel_version = 0
-            self._locks["chatgpt"].release()
 
     # ── Claude (CDP page in same browser as Gemini) ──
 
@@ -1531,7 +1027,7 @@ class App:
             raise RuntimeError("Claude export already in progress")
         urls = json.loads(urls_json)
         self.log.add(f"[INFO] Enqueuing Claude batch export ({len(urls)} urls)")
-        self._gw_queue.put(("export_claude_batch", urls))
+        self._gw_queue.put(("export_provider", ("claude", urls)))
         return "STARTED"
 
     def reconnect_claude(self):
@@ -1544,166 +1040,6 @@ class App:
             self.claude_page = None
         self._claude_connected = False
         self.add_claude_account()
-
-    def _export_claude(self, url, epoch=0, chat_order=0):
-        if epoch and self._claude_session_epoch != epoch:
-            self.log.add(f"[EXPORT][RACE] epoch_mismatch expected={epoch} current={self._claude_session_epoch}")
-            return None
-
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-
-        self.log.add(f"[INFO] Exporting Claude {url[:60]}...")
-        self._check_cancel()
-
-        try:
-            with self._cdp_lock:
-                self.pw_call(self.claude_page.goto, url, wait_until="domcontentloaded", timeout=30)
-                self.claude_page.wait_for_timeout(2000)
-
-            data = extract_claude_hybrid(
-                self.claude_page, url,
-                log_progress=self._push_log,
-                cancel_check=lambda: self._cancel_flag,
-            )
-
-            if not data:
-                self.log.add("[ERROR] Claude extraction returned no data")
-                self._push_log("ERR: Claude no data")
-                return None
-
-            if not data.get("messages"):
-                self.log.add("[ERROR] Claude extraction returned 0 messages, skipping write")
-                self._push_log("Claude ERR: 0 messages")
-                return None
-
-            path = self._claude_writer.write(data, chat_order=chat_order)
-            if not path:
-                self._push_log("Claude ERR: write failed")
-                return None
-
-            n = len(data.get("messages", []))
-            self.log.add(f"[SUCCESS] Claude {n} msgs → {path.name}")
-            self._push_log(f"Claude OK: {n} msgs — {data.get('title', '?')}")
-            return {"ok": True, "path": str(path), "count": n}
-
-        except Exception as e:
-            self.log.add(f"[ERROR] Claude export failed: {e}")
-            self._push_log(f"Claude ERR: {e}")
-            return None
-
-    def _do_export_claude_batch(self, urls):
-        if not self._locks["claude"].acquire(blocking=False):
-            self.log.add("[WARN] Claude sync BUSY")
-            self._push_log("Claude BUSY")
-            return
-        self.set_sync_state("claude", "running")
-        self.log.add(f"[CLAUDE] batch start user_urls={urls}")
-        batch_epoch = self._claude_session_epoch
-
-        self._claude_export_active = True
-        self._claude_writer = ExportWriter(out_dir=self._output_folders["claude"])
-
-        try:
-            if urls:
-                urls = list(dict.fromkeys(urls))
-                results = []
-                for idx, url in enumerate(urls, 1):
-                    self._check_cancel()
-                    if self._claude_session_epoch != batch_epoch:
-                        self.log.add(f"[BATCH][RACE] epoch_mismatch")
-                        break
-                    if not _check_cdp_alive():
-                        self.log.add("[WARN] CDP not available, stopping batch")
-                        self._push_log("Claude ERR: CDP lost")
-                        break
-
-                    self.log.add(f"[CLAUDE] [{idx}/{len(urls)}] exporting {url[:40]}")
-                    self._push_log(f"Claude [{idx}/{len(urls)}]...")
-                    r = self._export_claude(url, epoch=batch_epoch, chat_order=idx - 1)
-                    if r:
-                        results.append(r)
-                        if len(urls) == 1:
-                            break
-                    else:
-                        self.log.add(f"[CLAUDE] export returned None for {url[:60]}")
-
-                total = sum(r["count"] for r in results) if results else 0
-                self.set_sync_state("claude", "done")
-                self.log.add(f"[INFO] Claude batch done: {total} msgs from {len(results)}/{len(urls)} chats")
-                self._push_log(f"Claude batch: {total} msgs — {len(results)}/{len(urls)}")
-                return
-
-            adapter = ClaudeAdapter(
-                self.claude_page, self._cdp_lock,
-                self._push_log,
-                lambda: self._cancel_flag,
-            )
-            if not adapter.healthcheck():
-                self.log.add("[WARN] Claude adapter healthcheck failed")
-                self._push_log("Claude ERR: page not available")
-                return
-
-            chats = adapter.list_chats()
-            self.log.add(f"[CLAUDE] sidebar: {len(chats)} chats")
-            self._push_log(f"Claude sidebar: {len(chats)} chats")
-
-            if not chats:
-                self.log.add("[ERROR] No Claude chats found in sidebar")
-                self._push_log("Claude ERR: no chats in sidebar")
-                return
-
-            results = []
-            for chat_idx, chat in enumerate(chats):
-                self._check_cancel()
-                if self._claude_session_epoch != batch_epoch:
-                    break
-                if not _check_cdp_alive():
-                    self._push_log("Claude ERR: CDP lost")
-                    break
-
-                self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] {chat['title'][:40]}")
-                ok = adapter.open_chat(chat)
-                if not ok:
-                    self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] ERR: not found")
-                    continue
-
-                try:
-                    record = adapter.extract_chat(chat)
-                    if record:
-                        path = self._claude_writer.write(record.to_dict(), chat_order=chat_idx)
-                        if path:
-                            n = len(record.messages)
-                            results.append({"ok": True, "path": str(path), "count": n})
-                            self.log.add(f"[CLAUDE] [{chat_idx+1}/{len(chats)}] {n} msgs -> {path.name}")
-                            self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] OK: {n} msgs")
-                        else:
-                            self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] ERR: write failed")
-                    else:
-                        self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] ERR: no data")
-                except Exception as e:
-                    self.log.add(f"[CLAUDE] [{chat_idx+1}/{len(chats)}] error: {e}")
-                    self._push_log(f"Claude [{chat_idx+1}/{len(chats)}] ERR: {e}")
-
-            total_msgs = sum(r["count"] for r in results) if results else 0
-            self.set_sync_state("claude", "done")
-            self.log.add(f"[INFO] Claude batch done: {total_msgs} msgs from {len(results)}/{len(chats)} chats")
-            self._push_log(f"Claude batch: {total_msgs} msgs — {len(results)}/{len(chats)}")
-
-            try:
-                self.window.evaluate_js("copyLogContent()")
-            except Exception:
-                pass
-
-        except Cancelled:
-            self.set_sync_state("claude", "failed")
-            self.log.add("[INFO] Claude batch cancelled by user")
-            self._push_log("⏹ Claude sync cancelled")
-        finally:
-            self._claude_export_active = False
-            self._cancel_flag = False
-            self._cancel_version = 0
-            self._locks["claude"].release()
 
     # ── URL watcher (runs in _pw_worker idle loop) ──
 
@@ -1828,7 +1164,7 @@ class App:
 
         urls = json.loads(urls_json)
         self.log.add(f"[INFO] Enqueuing batch export ({len(urls)} urls from UI)...")
-        self._pw_queue.put(("export_batch", urls))
+        self._pw_queue.put(("export_provider", ("deepseek", urls)))
         return "STARTED"
 
     def reconnect(self):
@@ -1877,7 +1213,7 @@ class App:
             raise RuntimeError("Gemini export already in progress")
         urls = json.loads(urls_json)
         self.log.add(f"[INFO] Enqueuing Gemini batch export ({len(urls)} urls)")
-        self._gw_queue.put(("export_gemini_batch", urls))
+        self._gw_queue.put(("export_provider", ("gemini", urls)))
         return "STARTED"
 
     def reconnect_gemini(self):
@@ -1959,46 +1295,23 @@ class App:
             self.window.evaluate_js("setSyncRunning(true)")
         except Exception:
             pass
-        self.log.add("[INFO] Sync All — запуск всех провайдеров")
-        providers = [
-            ("deepseek", self.sync_provider, "[]"),
-            ("gemini",   self.sync_gemini, "[]"),
-            ("qwen",     self.sync_qwen, "[]"),
-            ("chatgpt",  self.sync_chatgpt, "[]"),
-            ("claude",   self.sync_claude, "[]"),
-        ]
-        active = [(n, fn, arg) for n, fn, arg in providers if self._is_provider_connected(n)]
-        if not active:
-            self.log.add("[INFO] No providers connected — nothing to sync")
+        self.log.add("[INFO] Sync All — последовательно: ChatGPT → Gemini → Claude → Qwen → DeepSeek")
+        order = ["chatgpt", "gemini", "claude", "qwen", "deepseek"]
+        for name in order:
+            if not self._is_provider_connected(name):
+                continue
+            self.log.add(f"[SYNC] Старт {name}...")
             try:
-                self.window.evaluate_js("setSyncRunning(false)")
-            except Exception:
-                pass
-            return
-        threads = []
-        for name, fn, arg in active:
-            t = threading.Thread(target=self._safe_run_provider, args=(name, fn, arg), daemon=True)
-            t.start()
-            threads.append((name, t))
-        for name, t in threads:
-            t.join(timeout=600)
-            if t.is_alive():
-                self.log.add(f"[WARN] {name} provider thread did not finish")
-        self.log.add(f"[INFO] Sync All — запущено {len(active)} провайдеров")
+                q = self._pw_queue if name == "deepseek" else self._gw_queue
+                q.put(("export_provider", (name, [])))
+            except Exception as e:
+                self.log.add(f"[ERROR] {name}: {e}")
+                self.set_sync_state(name, "failed")
+        self.log.add(f"[INFO] Sync All — выполнено")
         try:
             self.window.evaluate_js("setSyncRunning(false)")
         except Exception:
             pass
-
-    def _safe_run_provider(self, name, fn, arg):
-        self.log.add(f"[SYNC] Запуск {name}...")
-        try:
-            fn(arg)
-        except Cancelled:
-            self.set_sync_state(name, "failed")
-        except Exception as e:
-            self.log.add(f"[ERROR] {name}: {e}")
-            self.set_sync_state(name, "failed")
 
     def launch_chrome_cdp(self):
         if self.cdp.healthcheck():
@@ -2036,6 +1349,17 @@ class App:
         self.log.add(f"[INFO] snapshot → {self.ui_snapshot_path}")
         self._push_log(f"snapshot → {self.ui_snapshot_path}")
 
+    def _write_model(self, model, writer, label, chat_order):
+        path = writer.write(model, chat_order=chat_order)
+        if not path:
+            self._push_log(f"{label} ERR: write failed")
+            return None
+        n = len(model.messages)
+        source = model.metadata.get("source", "?")
+        self.log.add(f"[SUCCESS] {label} {n} msgs ({source}) → {path.name}")
+        self._push_log(f"{label} OK: {n} msgs — {model.title}")
+        return {"ok": True, "path": str(path), "count": n}
+
     def _push_log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         try:
@@ -2045,5 +1369,9 @@ class App:
 
 
 if __name__ == "__main__":
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    bundled_browsers = os.path.join(exe_dir, "ms-playwright")
+    if os.path.isdir(bundled_browsers):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bundled_browsers
     app = App()
-    webview.start(debug=True, icon='ui/icon.ico')
+    webview.start(debug=False, icon='ui/icon.ico')

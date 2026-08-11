@@ -20,3 +20,20 @@ release/
 analysis/
 inbox/
 SOURCE/
+
+# Internal agent docs / session plans (not part of the product)
+AGENTS.md
+.opencode/plans/
+
+# Experimental raw responses
+raw_responses/
+
+# Local dev helpers
+run-main.bat
+
+# Build artifacts
+build-venv/
+build/
+dist/
+*.zip
+*.iso

@@ -1,7 +1,8 @@
 import json
 
-from adapters.base import BaseAdapter, ChatRecord
-from adapters.normalize import normalize_messages
+from adapters.base import BaseAdapter
+from conversation.irbuilder import IRBuilder, Provider
+from conversation.models import ConversationModel
 from exporters.qwen_extract import extract_qwen_hybrid
 
 
@@ -10,7 +11,7 @@ QWEN_SIDEBAR_SCAN_JS = """
     .map((el, i) => ({
         id: `qwen-${i}`,
         title: (el.innerText || el.textContent || '').trim().substring(0, 200),
-        selector: `div.chat-item-drag:nth-of-type(${i+1}) a.chat-item-drag-link`
+        index: i
     }))
 """
 
@@ -22,10 +23,10 @@ QWEN_WAIT_MESSAGES_JS = """
 """
 
 QWEN_CLICK_JS = """
-(sel) => {
-    const el = document.querySelector(sel);
-    if (el) el.click();
-    return !!el;
+(index) => {
+    const els = document.querySelectorAll('a.chat-item-drag-link');
+    if (els[index]) { els[index].click(); return true; }
+    return false;
 }
 """
 
@@ -60,18 +61,24 @@ class QwenAdapter(BaseAdapter):
                 self.page.wait_for_timeout(3000)
                 items = self.page.evaluate(QWEN_SIDEBAR_SCAN_JS)
 
+        s = self._snapshot_sidebar_state('div.chat-item-drag a.chat-item-drag-link')
+        self._log_sidebar_snapshot("list_chats end", s, provider="QWEN")
         return items
 
     def open_chat(self, chat: dict) -> bool:
+        s = self._snapshot_sidebar_state('div.chat-item-drag a.chat-item-drag-link')
+        self._log_sidebar_snapshot("open_chat begin", s, provider="QWEN",
+                                   chat_index=chat.get("index", 0))
         with self.cdp_lock:
-            ok = self.page.evaluate(QWEN_CLICK_JS, chat["selector"])
+            index = chat.get("index", 0)
+            ok = self.page.evaluate(QWEN_CLICK_JS, index)
             if not ok:
                 return False
             self.page.wait_for_function(QWEN_WAIT_MESSAGES_JS, timeout=30000)
             self.page.wait_for_timeout(500)
         return True
 
-    def extract_chat(self, chat: dict) -> ChatRecord:
+    def extract_chat(self, chat: dict) -> ConversationModel | None:
         url = self.page.url
         data = extract_qwen_hybrid(
             self.page, url,
@@ -81,10 +88,7 @@ class QwenAdapter(BaseAdapter):
         if not data or not data.get("messages"):
             return None
 
-        return ChatRecord(
-            id=chat["id"],
-            title=chat["title"],
-            messages=normalize_messages(data["messages"]),
-            source="qwen",
-            url=url,
-        )
+        model = IRBuilder.build(Provider.QWEN, data)
+        model.metadata["provider"] = "qwen"
+        model.metadata["source"] = "dom"
+        return model

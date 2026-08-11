@@ -41,6 +41,21 @@ function setConnected() {
   setBridgeStatus("connected");
 }
 
+function addDeepSeekAccount() {
+  log("connecting DeepSeek...");
+  if (window.pywebview) {
+    window.pywebview.api.connect_deepseek().then(
+      function() {
+        log("DeepSeek connected");
+        setConnected();
+      },
+      function(err) {
+        log("DeepSeek connect failed: " + err);
+      }
+    );
+  }
+}
+
 function addAccount(provider) {
   currentProvider = provider;
   document.getElementById("modalTitle").textContent = "Подключить аккаунт";
@@ -534,17 +549,6 @@ function syncQwenSelected() {
 function reconnectQwen() {
   log("reconnect Qwen");
   addQwenAccount();
-}
-
-function pasteQwenUrl() {
-  const input = prompt("Вставьте URL чата Qwen (можно несколько, по одному на строке):");
-  if (!input) return;
-  const ta = document.getElementById("qwUrls");
-  const existing = ta.value.trim();
-  ta.value = existing ? existing + "\n" + input.trim() : input.trim();
-  ta.dispatchEvent(new Event("input", { bubbles: true }));
-  ta.dispatchEvent(new Event("change", { bubbles: true }));
-  log("URL(s) pasted into Qwen list");
 }
 
 // ── ChatGPT ──

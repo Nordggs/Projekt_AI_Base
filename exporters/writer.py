@@ -199,6 +199,29 @@ class ExportWriter:
         tmp.replace(path)
         return path
 
+    def flush_media(self, model):
+        """Write _captured assets to media/ dir, set local paths. Returns count."""
+        from conversation.models import ConversationModel as CM
+        if not isinstance(model, CM):
+            return 0
+        stable_id = model.stable_id
+        media_dir = self.out_dir / "media" / stable_id
+        media_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for msg in model.messages:
+            for att in msg.attachments:
+                capt = att.__dict__.pop("_captured", None)
+                if not capt:
+                    continue
+                ext = capt.content_type.split("/")[-1] if "/" in capt.content_type else "bin"
+                name = f"{hashlib.md5(capt.url.encode()).hexdigest()[:16]}.{ext}"
+                (media_dir / name).write_bytes(capt.body)
+                att.local = {"relative_path": f"media/{stable_id}/{name}"}
+                if capt.content_type.startswith("image/"):
+                    att.type = "image"
+                count += 1
+        return count
+
     def _fmt_ts(self, ts):
         if not ts:
             return ""
@@ -253,18 +276,27 @@ class ExportWriter:
             lines.append("> 🎨 Сгенерировано изображение:")
             if prompt:
                 lines.append(f"> {prompt}")
+            meta_pid = meta.get("api_id") or meta.get("provider_id")
+            if meta_pid:
+                lines.append(f"> Asset: `{meta_pid}`")
         elif atype in ("image", "file", "audio", "video"):
             lines.append("")
-            lines.append(f"> 📎 Вложение: {name if name != atype else 'файл'}")
+            is_partial = att.get("is_partial", True)
+            lines.append(f"> 📎 Вложение: {name if name != atype else 'файл'}" + (" (metadata-only)" if is_partial else ""))
             mime = att.get("mime")
             if mime:
                 lines.append(f"> Тип: {atype} / {mime}")
             else:
                 lines.append(f"> Тип: {atype}")
-            source = att.get("source", {}) or {}
-            pid = source.get("provider_id") if isinstance(source, dict) else None
-            if pid:
-                lines.append(f"> Asset: `{pid}`")
+            pointer = att.get("pointer")
+            if pointer:
+                lines.append(f"> Pointer: `{pointer}`")
+        elif atype == "runtime_asset":
+            lines.append("")
+            lines.append(f"> 📸 Runtime image (confidence: {meta.get('confidence', 'unknown')})")
+            mime = att.get("mime")
+            if mime:
+                lines.append(f"> Тип: {mime}")
         else:
             lines.append("")
             lines.append(f"> 📎 Вложение: {name}")

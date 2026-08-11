@@ -1,6 +1,9 @@
 import json
 import time
 import re
+import os
+import gzip
+from datetime import datetime
 
 GEMINI_EXTRACT_JS = """
 () => {
@@ -68,6 +71,16 @@ SCROLL_JS = """
     return true;
 }
 """
+
+TOKEN_REGEX = r'"SNlM0e":"([^"]+)"'
+
+# Set True to attempt Batchexecute RPC for Gemini (experimental — endpoint returns 404).
+# When False, extract_gemini_rpc returns None immediately → DOM fallback.
+GEMINI_ENABLE_RPC = False
+
+# Set True to write observatory/probe files to raw_responses/gemini/ during RPC attempts.
+# Requires GEMINI_ENABLE_RPC = True to have any effect.
+GEMINI_DEBUG = False
 
 GEMINI_TITLE_JS = """
 () => {
@@ -234,6 +247,68 @@ def _parse_gemini_batchexecute(text: str, chat_id: str, url: str) -> dict | None
     }
 
 
+def _save_gemini_observation(raw_text: str, chat_id: str, url: str, parsed):
+    """Pure observatory — saves raw + fingerprint + parsed ALWAYS. Never affects pipeline."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    raw_size = len(raw_text)
+
+    # Fingerprint on raw text only (not parsed)
+    depth = 0
+    max_depth = 0
+    for ch in raw_text[:100000]:
+        if ch in "[{":
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+
+    preview = raw_text[:500]
+    # Sanitize for JSON: strip surrogates
+    preview = preview.encode("utf-8", errors="replace").decode("utf-8")
+    alpha = float(sum(1 for c in preview if c.isprintable() and not c.isspace()))
+    density = alpha / max(1, len(preview))
+
+    observation = {
+        "meta": {
+            "url": url,
+            "chat_id": chat_id,
+            "timestamp": ts,
+            "f_req_payload": '[["hNvQHb","[[]]",null,"1"]]',
+        },
+        "raw": {
+            "type": type(raw_text).__name__,
+            "size": raw_size,
+            "preview": preview,
+        },
+        "fingerprint_raw": {
+            "depth_estimate": max_depth,
+            "string_density": round(density, 4),
+            "has_prefix_newline": raw_text.startswith(")"),
+            "starts_with_json": raw_text.lstrip()[:1] in ("[", "{"),
+        },
+        "parsed": parsed if parsed is not None else {"_error": "parse returned None"},
+    }
+
+    obs_dir = os.path.join("raw_responses", "gemini")
+    os.makedirs(obs_dir, exist_ok=True)
+
+    name = f"chat_{chat_id[:12]}_{ts}"
+
+    path = os.path.join(obs_dir, f"{name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(observation, f, indent=2, ensure_ascii=False)
+
+    raw_safe = raw_text.encode("utf-8", errors="replace").decode("utf-8")
+    raw_path = os.path.join(obs_dir, f"{name}_raw.txt")
+    if raw_size > 5 * 1024 * 1024:
+        raw_path += ".gz"
+        with gzip.open(raw_path, "wt", encoding="utf-8") as f:
+            f.write(raw_safe)
+    else:
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(raw_safe)
+
+
 def extract_gemini_via_api_intercept(page, url, log_progress=None, cancel_check=None, timeout_ms=15000):
     """Reload page and intercept Batchexecute response with conversation data."""
     chat_id = url.rstrip("/").rsplit("/", 1)[-1]
@@ -277,22 +352,116 @@ def extract_gemini_via_api_intercept(page, url, log_progress=None, cancel_check=
     return captured["data"]
 
 
-def extract_gemini_rpc(page, url) -> dict | None:
+def _save_token_probe(
+    page,
+    url,
+    chat_id,
+    *,
+    exit_reason: str,
+    exception: Exception | None = None,
+):
+    """Observe Gemini page state when RPC fails. Pure diagnostic, never affects pipeline."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        token = page.evaluate("""
-            () => {
+        data = page.evaluate(f"""
+            () => {{
                 const html = document.documentElement.innerHTML;
-                const m = html.match(/"SNlM0e":"([^"]+)"/);
+                const scripts = [...document.querySelectorAll('script')];
+
+                const markers = ['/_/Batchexecute', 'SNlM0e', 'f.req', 'rpcids', 'hNvQHb'];
+
+                /* Similar keys */
+                const simSet = new Set();
+                const simRe = /SNlM0[a-z]/g;
+                let mm;
+                while ((mm = simRe.exec(html)) !== null) simSet.add(mm[0]);
+
+                /* Script scan */
+                const matched = scripts
+                    .map((s, i) => {{
+                        const t = s.textContent || '';
+                        const m = markers.filter(x => t.includes(x));
+                        return {{ index: i, length: t.length, matched_markers: m, preview: m.length > 0 ? t.replace(/\\s+/g, ' ').substring(0, 300) : '' }};
+                    }})
+                    .filter(s => s.matched_markers.length > 0)
+                    .sort((a, b) => b.length - a.length)
+                    .slice(0, 5);
+
+                /* Token regex */
+                const tr = /{TOKEN_REGEX}/;
+                const tm = html.match(tr);
+
+                return {{
+                    page_url: location.href,
+                    page_title: document.title,
+                    probe: {{
+                        token_found_by_regex: tm !== null,
+                        html_size: html.length,
+                        script_count: scripts.length
+                    }},
+                    markers: {{
+                        has_batchexecute: html.includes('/_/Batchexecute'),
+                        has_SNlM0e: html.includes('SNlM0e'),
+                        similar_keys: [...simSet].sort(),
+                        has_f_req: html.includes('f.req'),
+                        has_rpcids: html.includes('rpcids'),
+                        has_hNvQHb: html.includes('hNvQHb')
+                    }},
+                    matching_scripts: matched
+                }};
+            }}
+        """)
+
+        probe_dir = os.path.join("raw_responses", "gemini", "token_probe")
+        os.makedirs(probe_dir, exist_ok=True)
+
+        name = f"chat_{chat_id[:12]}_{ts}"
+
+        meta = {
+            "url": url,
+            "chat_id": chat_id[:12],
+            "page_url": data.get("page_url", ""),
+            "page_title": data.get("page_title", ""),
+            "timestamp": ts,
+            "exit_reason": exit_reason,
+        }
+        if exception is not None:
+            meta["exception_type"] = type(exception).__name__
+            meta["exception_message"] = str(exception)[:500]
+
+        record = {
+            "meta": meta,
+            "probe": data.get("probe", {}),
+            "markers": data.get("markers", {}),
+            "matching_scripts": data.get("matching_scripts", []),
+        }
+
+        path = os.path.join(probe_dir, f"{name}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def extract_gemini_rpc(page, url) -> dict | None:
+    if not GEMINI_ENABLE_RPC:
+        return None
+    chat_id = url.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        token = page.evaluate(f"""
+            () => {{
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/{TOKEN_REGEX}/);
                 return m ? m[1] : null;
-            }
+            }}
         """)
         if not token:
+            if GEMINI_DEBUG:
+                _save_token_probe(page, url, chat_id, exit_reason="token_not_found")
             return None
 
-        chat_id = url.rstrip("/").rsplit("/", 1)[-1]
-
         result = page.evaluate("""
-            async (token, cid) => {
+            async ({token}) => {
                 const body = new URLSearchParams();
                 body.set('f.req', JSON.stringify([["hNvQHb","[[]]",null,"1"]]));
                 body.set('at', token);
@@ -301,12 +470,27 @@ def extract_gemini_rpc(page, url) -> dict | None:
                     return await r.text();
                 } catch(e) { return null; }
             }
-        """, token, chat_id)
+        """, {"token": token})
         if not result:
             return None
 
-        return _parse_gemini_batchexecute(result, chat_id, url)
-    except Exception:
+        parsed = _parse_gemini_batchexecute(result, chat_id, url)
+        if GEMINI_DEBUG:
+            try:
+                _save_gemini_observation(result, chat_id, url, parsed)
+            except Exception:
+                pass
+        return parsed
+    except Exception as exc:
+        if GEMINI_DEBUG:
+            try:
+                _save_token_probe(
+                    page, url, chat_id,
+                    exit_reason="exception",
+                    exception=exc,
+                )
+            except Exception:
+                pass
         return None
 
 

@@ -6,7 +6,8 @@ from pathlib import Path
 
 from config import CHATGPT_DIAGNOSE, DIAGNOSE_DIR
 from conversation.models import ConversationModel, ValidationResult
-from conversation.adapters import from_chatgpt_api, from_next_data, from_dom
+from conversation.adapters import from_next_data
+from conversation.irbuilder import IRBuilder, Provider
 from conversation.validator import validate_all
 
 
@@ -342,7 +343,7 @@ def extract_chatgpt_pipeline(page, url, capture_result=None, log_progress=None, 
         if capture_result:
             if log_progress:
                 log_progress(f"[CHATGPT] API captured: {len(capture_result.get('mapping', {}))} nodes")
-            model = from_chatgpt_api(capture_result, url, log_func=log_progress)
+            model = IRBuilder.build(Provider.CHATGPT_API, capture_result, url=url, log_func=log_progress)
             _save_diagnostics(page, conv_id, api_raw=json.dumps(capture_result, ensure_ascii=False))
 
         # Tier 2: __NEXT_DATA__
@@ -366,7 +367,7 @@ def extract_chatgpt_pipeline(page, url, capture_result=None, log_progress=None, 
                 log_progress("[CHATGPT] WARN: conversation may not be fully loaded")
             dom_data = extract_chatgpt_dom(page, url, log_progress=log_progress, cancel_check=cancel_check)
             if dom_data and dom_data.get("messages"):
-                model = from_dom(dom_data)
+                model = IRBuilder.build(Provider.CHATGPT_DOM, dom_data)
                 source_label = "dom"
                 if log_progress:
                     log_progress(f"[CHATGPT] DOM source: {len(dom_data['messages'])} msgs")

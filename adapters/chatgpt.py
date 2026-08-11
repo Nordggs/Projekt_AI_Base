@@ -5,7 +5,8 @@ from conversation.models import ConversationModel
 from exporters.chatgpt_extract import (
     ApiCapture, extract_chatgpt_pipeline, extract_chatgpt_dom, ensure_conversation_loaded,
 )
-from conversation.adapters import from_next_data, from_dom
+from conversation.adapters import from_next_data
+from conversation.irbuilder import IRBuilder, Provider
 
 
 CHATGPT_SIDEBAR_SCAN_JS = """
@@ -141,7 +142,7 @@ class ChatGPTAdapter(BaseAdapter):
                 ok = ensure_conversation_loaded(self.page, log_progress=self.log, cancel_check=self.cancel_check)
                 dom_data = extract_chatgpt_dom(self.page, url, log_progress=self.log, cancel_check=self.cancel_check)
                 if dom_data and dom_data.get("messages"):
-                    model = from_dom(dom_data)
+                    model = IRBuilder.build(Provider.CHATGPT_DOM, dom_data)
                     model.metadata["source"] = "dom"
                     if self.log:
                         self.log(f"[CHATGPT] DOM: {len(dom_data['messages'])} msgs")

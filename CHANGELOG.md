@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.5.0 — Stable release (2026-08-12)
+
+### New
+- **Пять провайдеров**: ChatGPT, Gemini, Claude, Qwen, DeepSeek — полный экспортный контур через CDP
+- **ConversationModel** — единое ядро диалога (`conversation/`): IRBuilder, Enricher, Serializer, Validator
+- **Enricher + attachment_capture** — захват CDN/blob-вложений и runtime-метаданных при экспорте
+- **Релизная упаковка**: PyInstaller onedir + bundled Chromium (`ms-playwright/`)
+- **Установщик** (Inno Setup) и **Portable ZIP** — работают без установленного Python
+- **`PLAYWRIGHT_BROWSERS_PATH`** указывает на bundled браузер; CDPManager ищет Chrome: bundled → системный → RuntimeError
+- **LICENSE** (MIT) + **THIRD_PARTY_NOTICES.md**
+
+### Fixed
+- Gemini: устранена гонка перезагрузки между экспортами (34/34)
+- Qwen: устранены обе регрессии — ложный preflight и привязка чат ↔ файл (20/20)
+- ChatGPT 28/28, DeepSeek 66/66, Claude 8/8 — контрольные прогоны
+
+### Changed
+- `debug=True` → `False` в `webview.start()` (релизный запуск)
+- README актуализирован под актуальную структуру (adapters/conversation/exporters)
+
+---
 ## v0.4.5 — Qwen Sidebar FSM (2026-06-22)
 
 ### Changed

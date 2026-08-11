@@ -186,7 +186,6 @@
         <div id="qwenUrls" class="url-area hidden">
           <label for="qwUrls">URL чатов (по одному на строке):</label>
           <textarea id="qwUrls" placeholder="https://chat.qwen.ai/c/..."></textarea>
-          <button class="small paste-url" onclick="pasteQwenUrl()">📋 Вставить URL</button>
         </div>
 
         <button id="btnQwenSyncSelected" class="primary" disabled onclick="syncQwenSelected()">Синхронизировать выбранный чат</button>
@@ -197,7 +196,7 @@
         <div class="card-header">
           <h2>DeepSeek</h2>
           <span class="badge">Нет аккаунтов</span>
-          <button class="small" onclick="addAccount('deepseek')">+ аккаунт</button>
+          <button class="small" onclick="addDeepSeekAccount()">+ аккаунт</button>
         </div>
 
         <div class="empty" id="dsEmpty">

@@ -1,4 +1,4 @@
-from conversation.models import ConversationModel, ValidationResult
+from conversation.models import AttachmentNode, ConversationModel, ValidationResult
 
 
 def validate_structure(model: ConversationModel) -> ValidationResult:
@@ -22,7 +22,7 @@ def validate_roles(model: ConversationModel) -> ValidationResult:
         errors.append("no user messages")
     if not has_assistant:
         errors.append("no assistant messages")
-    valid_roles = {"user", "assistant", "system"}
+    valid_roles = {"user", "assistant", "system", "tool"}
     bad = [m.role for m in model.messages if m.role not in valid_roles]
     if bad:
         errors.append(f"invalid roles found: {set(bad)}")
@@ -67,11 +67,11 @@ def validate_attachments(model: ConversationModel) -> ValidationResult:
     warnings = []
     for idx, msg in enumerate(model.messages):
         for aidx, att in enumerate(msg.attachments):
-            if not isinstance(att, dict):
-                warnings.append(f"msg[{idx}].attachments[{aidx}] is not a dict")
+            if not isinstance(att, AttachmentNode):
+                warnings.append(f"msg[{idx}].attachments[{aidx}] is not AttachmentNode")
                 continue
-            if att.get("type") and att["type"] not in ("image", "file", "audio", "video", "generated_image"):
-                warnings.append(f"msg[{idx}].attachments[{aidx}]: unknown type '{att['type']}'")
+            if att.type and att.type not in ("image", "file", "audio", "video", "runtime_asset", "generated_image"):
+                warnings.append(f"msg[{idx}].attachments[{aidx}]: unknown type '{att.type}'")
     return ValidationResult(ok=True, warnings=warnings)
 
 

@@ -1,6 +1,8 @@
+import glob
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -85,9 +87,36 @@ class CDPManager:
         except Exception:
             return False
 
+    def _bundled_chrome_path(self):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        matches = []
+        for pattern in (
+            os.path.join(exe_dir, "ms-playwright", "chromium-*", "chrome-win64", "chrome.exe"),
+            os.path.join(exe_dir, "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
+        ):
+            matches += glob.glob(pattern)
+        if not matches:
+            return None
+
+        def version_key(p):
+            try:
+                seg = p.split(os.sep)
+                for s in seg:
+                    if s.startswith("chromium-"):
+                        return int(s.split("-", 1)[1])
+            except Exception:
+                pass
+            return 0
+
+        return sorted(matches, key=version_key)[-1]
+
     def _launch_chrome(self):
         os.makedirs(self._chrome_dir, exist_ok=True)
-        paths = [
+        paths = []
+        bundled = self._bundled_chrome_path()
+        if bundled:
+            paths.append(bundled)
+        paths += [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             os.path.expandvars(
                 r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
