@@ -1,393 +1,153 @@
-# Architecture — AI Chat Exporter v0.5.0-dev
+# Architecture — AI Chat Exporter v0.5.0
 
 ## Overview
 
-Desktop application for exporting AI chat conversations (Gemini, DeepSeek, Qwen) to local Markdown files. No API keys, no cloud dependencies — works through browser automation (Playwright) and Chrome DevTools Protocol (CDP) for Gemini and Qwen.
-
----
-
-## Architecture Diagram
+Desktop application that exports AI chat dialogs from five providers (**ChatGPT, Gemini, Claude, Qwen, DeepSeek**) into local Markdown files. No API keys and no cloud services — the app drives a real browser through Chrome DevTools Protocol (CDP) and Playwright, reads the rendered page, and normalizes the content into a unified conversation model.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        UI (pywebview)                       │
-│                   ui/app.html + app.js                      │
-│              Two-way bridge via pywebview API                │
-└──────┬───────────────────────────────────────────┬───────────┘
-       │                                           │
-       ▼                                           ▼
-┌──────────────┐                        ┌──────────────────────────┐
-│  _pw_worker  │                        │    _gw_worker            │
-│  (thread)    │                        │    (thread)              │
-│              │                        │                          │
-│  DeepSeek    │                        │  Gemini (CDP)            │
-│  Playwright  │                        │  Qwen (CDP, same tab)    │
-│  Browser     │                        │  sync_playwright()       │
-└──────┬───────┘                        └──────┬───────────────────┘
-       │                                       │
-       ▼                                       ▼
-┌──────────────┐                        ┌──────────────────────┐
-│ DeepSeek     │                        │ Gemini Extraction    │
-│ Exporter     │                        │ RPC + DOM fallback   │
-│ Scroll Engine│                        │ Scroll-loop ingestor │
-│ (legacy)     │                        │                      │
-└──────┬───────┘                        │ Qwen Extraction      │
-       │                                │ DOM scroll-loop      │
-       │                                │ Soft page recovery   │
-       │                                │ _cdp_lock            │
-       └──────────────┬─────────────────┴──────────────┬───────┘
-                      ▼                                ▼
-              ┌────────────────┐              ┌────────────────┐
-              │  ExportWriter  │              │  ExportWriter   │
-              │  raw/gemini/   │              │  raw/qwen/      │
-              └────────────────┘              └────────────────┘
+UI (pywebview) ── window.pywebview.api.* ──> main.py App
+                                              │
+                    ┌─────────────────────────┴──────────────────────────┐
+                    ▼                                                     ▼
+             _pw_worker (thread)                                  _gw_worker (thread)
+             DeepSeekAdapter                                        Gemini / Qwen / ChatGPT / Claude
+             own Playwright + CDPContext                            shared CDP browser (own Playwright)
+                    │                                                     │
+                    ▼                                                     ▼
+             DeepSeekExporter                                 adapters (list_chats → open_chat → extract_chat)
+                    │                                                     │
+                    └──────────────┬──────────────────────────────────────┘
+                                   ▼
+                          conversation/ pipeline
+                    IRBuilder → ConversationModel → Enricher → Validator
+                                   │
+                                   ▼
+                           ExportWriter → raw/<service>/*.md
 ```
 
----
+## Modules
 
-## Components
+| Module | Responsibility |
+|--------|----------------|
+| `ui/` | Desktop UI (HTML/JS/CSS) rendered by pywebview |
+| `main.py` | Application orchestration: workers, queues, sync state, cancel |
+| `adapters/` | Browser lifecycle (`cdp_manager.py`) + per-provider adapters |
+| `conversation/` | Unified data model and enrichment pipeline |
+| `exporters/` | Page extraction scripts + markdown writer + attachment capture |
+| `core/` | Thread-safe logging (`LogBuffer`) |
 
-### 1. Frontend (`ui/`)
+## Runtime model
 
-- **app.html** — layout: provider cards (Gemini, DeepSeek, Qwen, ChatGPT, Claude), CDP modal, log panel, splash screen
-- **app.js** — bridges Python backend via `window.pywebview.api.*`:
-  - `addQwenAccount()` → calls `connect_qwen()` — создаёт страницу Qwen в общем CDP
-  - `syncQwenAll/SyncSelected` → sends URLs to `sync_qwen()`
-  - `cancelQwen()` → per-provider cancel
-  - `launchChromeCDP()`, `checkGeminiCDP()` — CDP lifecycle
-  - `fadeSplash()` — скрывает splash при готовности bridge
-- **app.css** — dark UI theme, modal styles, CDP status indicators, splash overlay
-- **icon.png** — window icon (pywebview) + favicon
-- **splash.png** — splash screen изображение
+- **CDPManager** (`adapters/cdp_manager.py`) owns the Chrome process only — no Playwright, no pages. It resolves Chrome in order **bundled → system → `RuntimeError`**, launches it with `--remote-debugging-port=9222` and a persistent profile (`~/.ai_pipeline/chrome_gemini`), so logins survive restarts.
+- **Two worker threads**: `_pw_worker` runs DeepSeek with its own Playwright instance and a `CDPContext` wrapper (single window); `_gw_worker` runs Gemini, Qwen, ChatGPT and Claude against the shared CDP browser.
+- Each provider has its own lock (`_locks[provider]`, non-blocking) — exporting one provider never blocks another.
+- Cancellation is a single global flag (`_cancel_flag` + `_cancel_version` token) applied in three layers: cooperative `_check_cancel()` in loops → `_soft_stop()` (`window.stop()` on all pages) → versioned `pw_call()` wrapper for Playwright I/O.
 
-### 2. Backend (`main.py`)
+## Provider integration
 
-#### Two isolated workers (threads)
+| Provider | Adapter | Navigation & extraction |
+|----------|---------|--------------------------|
+| ChatGPT | `ChatGPTAdapter` | Adapter path: `list_chats()` → `open_chat()` → `extract_chat()` (sidebar scan + click-through). Extraction pipeline: API → `NEXT_DATA` → DOM |
+| Gemini | `GeminiAdapter` | Sidebar link click (no deep-link hydration in the SPA). Extraction: RPC (`/_/Batchexecute`) first, DOM scroll-loop as fallback |
+| Claude | `ClaudeAdapter` | Adapter path: sidebar scan + click-through. DOM extraction with a fallback pass when assistant messages lack marker attributes |
+| Qwen | `QwenAdapter` | Sidebar DOM FSM (click → wait for messages in URL). Extraction: DOM scroll-loop with CDP `DOMSnapshot` fallback |
+| DeepSeek | `DeepSeekAdapter` | Own worker thread; `DeepSeekExporter` scroll engine over the conversation page |
 
-**`_pw_worker`** — DeepSeek export:
-- Owns `self.pw` (Playwright browser)
-- Commands: `connect`, `reconnect`, `export_batch`
-- Uses `DeepSeekExporter` (scroll engine v2)
+ChatGPT and Claude connect through the shared CDP context (`_cdp_browser().contexts[0]`); Gemini and Qwen share the same browser context. A `_cdp_lock` protects browser-level operations (`new_page` + `goto`) only — not the whole export.
 
-**`_gw_worker`** — Gemini + Qwen export:
-- Owns `self.gemini_pw`, `self.gemini_page` (CDP-connected)
-- Owns `self.qwen_page` (CDP page in same browser context)
-- Commands: `connect_gemini`, `export_gemini_batch`, `connect_qwen`, `export_qwen_batch`
-- Thread-safe via `_cdp_lock` for browser-level ops (`new_page`, `goto`)
+## Conversation pipeline (`conversation/`)
 
-#### Key methods
+- **IRBuilder** (`irbuilder.py`) — converts raw provider output into a unified `ConversationModel`.
+- **ConversationModel** (`models.py`) — the core representation: messages, attachment nodes, validation results.
+- **Enricher** (`enrichment.py`) — attaches runtime data and CDP-captured assets (`CapturedAsset`) and blobs to messages. Attachments that cannot be fetched (CDN/blob) are marked as `partial`; the chat is still exported.
+- **Serializer** (`serializer.py`) / **Validator** (`validator.py`) — tree conversion (`tree_to_dict` / `dict_to_tree`) and consistency checks.
+
+## Export path (`exporters/writer.py`)
+
+- **ExportWriter** writes to `raw/<service>/{service}_{stable_id[:8]}_{hash6}.md`.
+- `stable_id` chain: `data["chat_id"]` → URL last segment → `sha1(title|source)[:12]`.
+- **Atomic write**: `.md.tmp` → `.replace()` (NTFS/ext4). Existing files are never overwritten.
+- **Dedup**: a hash comment inside each file (`<!-- hash: … title: … chat_order: … -->`).
+
+```markdown
+<!-- hash: e7f89a title: chat title chat_order: 0 -->
+
+#### 👤 Вы (2024-01-15 14:30)
+user message
+
+#### 🤖 AI
+assistant message
+```
+
+## UI bridge (pywebview)
+
+JavaScript calls `window.pywebview.api.*`; the backend always raises `RuntimeError` on failure (never returns an error string).
 
 | Method | Purpose |
 |--------|---------|
-| `_do_connect_gemini()` | CDP attach: HTTP probe → `connect_over_cdp()` → `ctx.new_page()` |
-| `_ensure_gemini_page()` | Ping page; recreate via CDP context if closed |
-| `_goto_gemini(url)` | Navigate with auto-retry on "Target closed" |
-| `_export_gemini(url)` | Full export pipeline: goto → RPC → DOM → write |
-| `_do_export_gemini_batch(urls)` | Loop over URLs, collect results, log totals |
-| `_do_connect_qwen()` | Создаёт страницу Qwen в существующем CDP контексте |
-| `ensure_qwen_alive()` | Проверяет доступность page (`.url` без evaluate) |
-| `_load_qwen_sidebar()` | Goto `chat.qwen.ai/` + wait for sidebar render, return item count |
-| `_click_qwen_chat(index)` | Re-query DOM + click `div.chat-item-drag a.chat-item-drag-link[i]` |
-| `_wait_qwen_messages()` | Post-click guard: `messages > 0 && /c/ in URL` |
-| `_export_qwen(url)` | Sync Selected: load sidebar → click-by-index until URL match → extract |
-| `_do_export_qwen_batch(urls)` | Sync All (empty urls): sidebar-only FSM, iterate all items; Sync Selected (urls): delegate to `_export_qwen()` |
-| `add_qwen_account()` | API: постановка в очередь connect_qwen |
-| `sync_qwen(urls)` | API: проверка CDP alive → enqueue |
-| `reconnect_qwen()` | Close + re-create Qwen page |
-| `launch_chrome_cdp()` | Launch Chrome with `--remote-debugging-port=9222`, persistent profile |
-| `launch_chrome()` | API bridge |
+| `launch_chrome()` / `close_chrome()` | Start/stop the CDP Chrome instance |
+| `connect_gemini()` / `connect_qwen()` / `connect_chatgpt()` / `connect_claude()` | Open the provider page in the shared CDP browser |
+| `add_account(url)` | DeepSeek login / chat URL registration |
+| `sync_gemini("[]")` / `sync_qwen("[]")` / … | Enqueue a batch export for one provider |
+| `sync_all()` | One thread per connected provider, joined after completion |
+| `cancel_all()` | Set the cancel flag + bump the cancel version |
+| `get_providers_status()` | `{gemini: bool, qwen: bool, …}` |
 
-### 3. Extraction
+Sync state per provider (`idle` → `running` → `done` / `failed`) is pushed to the UI as `setProviderSync(provider, status)`.
 
-#### Gemini (`exporters/gemini_extract.py`)
-
-**A. RPC extraction** (`extract_gemini_rpc`):
-- Extracts `"SNlM0e"` token from page HTML
-- POSTs to `/_/Batchexecute` with `hNvQHb` request key
-- Parses JSON response into message list
-- Fast, but requires token (not always available)
-
-**B. DOM extraction** (`extract_gemini_dom`):
-- Scroll-loop ingestor (up to 50 iterations, ~60s total)
-- `GEMINI_EXTRACT_JS` — selects Angular components:
-  `<user-query>` → `role: "user"`, `<model-response>` → `role: "assistant"`
-- `SCROLL_BOTTOM_JS` — scrolls `scrollingElement → main → body` to bottom
-- Forced `scroll` + `resize` events to trigger Gemini lazy-load
-- Stop conditions (both must pass `i > 10`):
-  1. **Stable**: 6 consecutive iterations with zero new deduped messages
-  2. **No progress**: 10 iterations with same last-message fingerprint (first 200 chars)
-
-#### Qwen (`exporters/qwen_extract.py` + `exporters/cdp_snapshot.py`)
-
-**Navigation (sidebar-only FSM)** — Qwen uses a React SPA without deep-link hydration or API-based chat list. Navigation is purely UI-driven:
-- Source of truth: sidebar DOM (`div.chat-item-drag`), not API, not URL
-- Discovery: `document.querySelectorAll('div.chat-item-drag').length` — counts all available chats
-- Navigation: `document.querySelectorAll('div.chat-item-drag a.chat-item-drag-link')[i].click()` — re-query DOM per click to avoid stale NodeList
-- Validation: `messages > 0 && location.href.includes('/c/')` — wait for post-click invariant
-- No `goto(/c/{id})`, no `location.href`, no `a[href]` selectors — SPA ignores direct URL navigation
-
-**Message extraction** — две стратегии, попытка evaluate → fallback на DOMSnapshot:
-- **Fast path** (`extract_qwen_dom`): DOM scroll-loop ingestor с `page.evaluate()`
-  - `QWEN_EXTRACT_JS` — multiple selector candidates:
-    `.message-item`, `[class*="message"]`, `[data-role]`, `.user-message`, `.assistant-message`
-  - `QWEN_SCROLL_JS` — scrolls `[class*="virtual"]` → `[class*="scroll"]` → `main` → `scrollingElement`
-  - `QWEN_DEBUG_JS` — debug mode: dumps DOM structure on first run (diagnostic only)
-- **Snap path** (`CdpSnapshotExtractor`): `DOMSnapshot.captureSnapshot` — renderer-level
-  - 1 CDP session per extractor lifecycle
-  - Incremental scroll + snapshot loop (convergence-based, not fixed steps)
-  - Position-aware dedupe: `(role, content, dom_position)`
-  - `capture_conversation()`: scroll → snapshot → merge → repeat until stable
-- `extract_qwen_hybrid()` — точка входа: evaluate → snapshot fallback
-
-#### Deduplication
-- `seen` set tracks `content[:120]` — only for merging, NOT for stop decisions
-
-### 4. CDP Connection Flow
-
-#### Gemini
-```
-User clicks "🚀 Запустить Chrome"
-  → launch_chrome_cdp()
-    → _check_cdp_alive()? → "ALREADY_RUNNING" skip
-    → subprocess.Popen(chrome --remote-debugging-port=9222 --user-data-dir=...)
-    → return "OK"
-
-User clicks "Проверить подключение"
-  → checkGeminiCDP() → add_gemini_account('cdp')
-    → _gw_queue.put("connect_gemini")
-    → _do_connect_gemini()
-      → _check_cdp_alive() ← HTTP GET /json/version
-      → connect_over_cdp("http://127.0.0.1:9222")
-      → ctx.new_page()
-      → goto("https://gemini.google.com/")
-      → set gemini_pw, gemini_page
-
-On export:
-  → _ensure_gemini_page() — ping; recreate if dead
-  → _goto_gemini(url) — retry once on "Target closed"
-  → extract → writer.write()
-```
-
-#### Qwen (shared CDP with Gemini)
-```
-User clicks "+ аккаунт" on Qwen card
-  → addQwenAccount()
-    → _gw_queue.put("connect_qwen")
-    → _do_connect_qwen()
-      → ctx.new_page()
-      → goto("https://chat.qwen.ai/")
-
-Sync All (sidebar-only FSM):
-  → goto("https://chat.qwen.ai/") (under _cdp_lock)
-  → total = querySelectorAll('div.chat-item-drag').length
-  → for i in range(total):
-      → click(a.chat-item-drag-link[i]) — re-query DOM per iteration
-      → wait_for_function(messages > 0 && /c/ in URL)
-      → extract_qwen_hybrid():
-          try:
-            → extract_qwen_dom() — evaluate-based scroll-loop
-          except:
-            → CdpSnapshotExtractor.capture_conversation()
-              → scroll → DOMSnapshot → extract → merge (stable loop)
-      → writer.write()
-
-Sync Selected (by URL):
-  → load sidebar (как выше)
-  → for i in range(total):
-      → click(i)
-      → if chat_id in page.url:
-          → extract → write → return
-```
-
-### 5. Writer (`exporters/writer.py`)
-
-- `ExportWriter(out_dir)` — creates `out_dir` on init with `parents=True`
-- `write(data)` — writes to `{out_dir}/{service}/{title}_{service}_{date}_{hash10}.md`
-- `_to_markdown(data)` — formats as:
-  ```
-  #### 👤 Вы
-  {user message}
-
-  #### 🤖 AI
-  {assistant message}
-  ```
-
----
-
-## Data Flow
-
-### Gemini (full pipeline)
-
-```
-UI paste URL → syncGeminiSelected()
-  → sync_gemini([url])
-    → raise if gemini_pw is None
-    → _gw_queue.put("export_gemini_batch", urls)
-
-_gw_worker:
-  → _do_export_gemini_batch(urls)
-    → ExportWriter(out_dir="raw/gemini")
-    → for each url:
-        → _export_gemini(url)
-          → _goto_gemini(url)
-          → extract_gemini_rpc()  ← fast path
-          → if not data → extract_gemini_dom()  ← scroll-loop
-          → if data → ExportWriter.write()
-    → log "X msgs from Y/Z chats"
-```
-
-### Qwen (full pipeline)
-
-```
-UI paste URL → syncQwenSelected()
-  → sync_qwen([url])
-    → raise if not _qwen_connected
-    → _gw_queue.put("export_qwen_batch", urls)
-
-_gw_worker:
-  → _do_export_qwen_batch(urls)
-    → ExportWriter(out_dir="raw/qwen")
-
-    # Sync All (empty urls) — sidebar-only FSM
-    if not urls:
-      → _load_qwen_sidebar()
-        → goto("https://chat.qwen.ai/")
-        → total = querySelectorAll('div.chat-item-drag').length
-      → for i in range(total):
-          → _click_qwen_chat(i)
-          → _wait_qwen_messages()
-          → extract_qwen_hybrid()  ← scroll-loop
-          → ExportWriter.write()
-      → log "X msgs from Y/Z total chats"
-
-    # Sync Selected (user-provided urls)
-    else:
-      → for each url:
-          → _export_qwen(url)
-            → _load_qwen_sidebar()
-            → iterate over items[i]:
-                click(i)
-                if chat_id in url → extract → write → break
-```
-
----
-
-## Error Handling Contract
+## Error handling
 
 | Layer | Success | Error |
 |-------|---------|-------|
-| Backend Python | `return value` or `dict` | `raise RuntimeError(...)` |
-| API bridge | return via pywebview | exception → Promise rejection |
+| Backend | `return value` / `dict` | `raise RuntimeError(...)` |
+| API bridge | value via pywebview | exception → Promise rejection |
 | UI | `.then(resp)` | `.catch(err)` |
 
-**Never** `return "ERR: string"` — always `raise`.
+## Bundled runtime
 
----
+Release builds are PyInstaller `onedir` packages that ship their own Chromium:
+- `PLAYWRIGHT_BROWSERS_PATH` is pointed at `<exe_dir>/ms-playwright` before the first `sync_playwright().start()`.
+- Chrome resolution in `CDPManager`: bundled → system → `RuntimeError`.
+- No system Python or Chrome is required at runtime.
 
-## CDP Health Check
-
-```python
-def _check_cdp_alive():
-    """HTTP GET /json/version → verify webSocketDebuggerUrl exists"""
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1) as r:
-            return "webSocketDebuggerUrl" in json.load(r)
-    except Exception:
-        return False
-```
-
-Used in:
-- `launch_chrome_cdp()` — skip launch if already alive
-- `_do_connect_gemini()` — fail-fast if CDP not running
-- `_do_connect_qwen()` — fail-fast if CDP not running
-
----
-
-## Qwen Navigation & Extraction Stability (v0.5.0-dev)
-
-Qwen uses a React SPA without deep-link hydration or API-based chat list. Two independent layers: **navigation** (sidebar-only DOM FSM) and **extraction** (hybrid evaluate + snapshot). The hybrid extraction model eliminates dependency on JS runtime:
+## File structure
 
 ```
-extract_qwen_hybrid():
-  try:
-    → page.evaluate() — fast path (JS runtime)
-  except:
-    → CdpSnapshotExtractor.capture_conversation()
-      → 1 CDP session per extractor
-      → scroll → DOMSnapshot.captureSnapshot → extract
-      → repeat until convergence (stable iterations)
-      → dedupe by (role, content, dom_position)
-
-Key properties:
-  • renderer-level extraction — no JS execution context dependency
-  • survives SPA reload, navigation, context destruction
-  • virtualized chat support — incremental scroll snapshots
-  • no healthchecks, no reconnect loops, no recovery logic
-```
-
----
-
-## Chrome Profile
-
-- **Location**: `~/.ai_pipeline/chrome_gemini`
-- **Persistent**: login is preserved between sessions (Gemini + Qwen)
-- **Created on first launch**: `os.makedirs(chrome_dir, exist_ok=True)`
-
----
-
-## File Structure
-
-```
-├── main.py                      # Entry point (pywebview UI + backend workers)
-├── core/
-│   └── logger.py                # LogBuffer (thread-safe, max_size=5000)
+├── main.py                      # Entry point (pywebview UI + 2 workers)
+├── adapters/
+│   ├── base.py                  # BaseAdapter ABC
+│   ├── cdp_manager.py           # CDPManager (browser lifecycle) + CDPContext
+│   ├── chatgpt.py               # ChatGPTAdapter
+│   ├── claude.py                # ClaudeAdapter
+│   ├── qwen.py                  # QwenAdapter
+│   ├── gemini.py                # GeminiAdapter
+│   └── deepseek.py              # DeepSeekAdapter
+├── conversation/
+│   ├── models.py                # ConversationModel (core)
+│   ├── irbuilder.py             # IRBuilder: adapter → ConversationModel
+│   ├── enrichment.py            # Enricher: CDP assets + runtime + blobs
+│   ├── serializer.py            # serialization
+│   └── validator.py             # validation
 ├── exporters/
-│   ├── __init__.py
-│   ├── base.py                  # Browser abstraction (webview/playwright modes)
-│   ├── cdp_snapshot.py          # CdpSnapshotExtractor — DOMSnapshot.captureSnapshot
-│   ├── deepseek.py              # DeepSeekExporter (legacy scroll engine)
-│   ├── gemini_extract.py        # Gemini RPC + DOM extraction, scroll-loop
-│   ├── qwen_extract.py          # Qwen hybrid extraction (evaluate + snapshot)
-│   ├── playwright_browser.py    # BrowserPlaywright wrapper
-│   └── writer.py                # ExportWriter (Markdown output)
+│   ├── writer.py                # ExportWriter (atomic write, dedup, timestamps)
+│   ├── gemini_extract.py        # Gemini DOM extraction
+│   ├── chatgpt_extract.py       # ChatGPT DOM extraction
+│   ├── claude_extract.py        # Claude DOM extraction
+│   ├── qwen_extract.py          # Qwen DOM extraction
+│   ├── deepseek.py              # DeepSeekExporter
+│   └── attachment_capture.py    # CDP attachment capture
+├── core/
+│   └── logger.py                # LogBuffer (thread-safe)
 ├── ui/
-│   ├── app.html                 # UI layout + splash screen
+│   ├── app.html                 # UI layout
 │   ├── app.js                   # UI logic + pywebview bridge
-│   ├── app.css                  # Styles + splash + CDP modal
-│   ├── icon.png                 # Window icon / favicon
-│   └── splash.png               # Splash screen image
-├── raw/                         # Output directory (gitignored)
-│   ├── deepseek/
-│   ├── gemini/
-│   └── qwen/
-├── CHANGELOG.md                 # Version history
-├── requirements.txt             # pywebview>=4.0, playwright>=1.40
-├── .gitignore
-├── README.md
-└── ARCHITECTURE.md              # This file
+│   ├── app.css                  # Styles + splash
+│   └── icon.ico                 # Window icon
+└── raw/                         # Output .md files (gitignored)
 ```
-
----
-
-## Configuration Constants
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `MAX_LOGIN_SOFT` | 600 | DeepSeek login soft timeout (s) |
-| `MAX_LOGIN_HARD` | 1800 | DeepSeek login hard timeout (s) |
-| `MAX_STABLE` | 6 | DOM extraction: stop after N zero-growth iterations |
-| `MAX_NO_NEW` | 10 | DOM extraction: stop after N same-fingerprint iterations |
-| `MAX_ITER` | 50 | DOM extraction: max scroll iterations |
-| Scroll delay | 1200ms | Wait after scroll for lazy-load |
-| Event delay | 300ms | Wait after dispatchEvent |
-| CDP timeout | 1s | HTTP probe timeout |
-| CDP connection | 30s | add_gemini_account() / add_qwen_account() wait timeout |
-| Qwen backoff | 3 failures | Reload page before reconnect |
-
----
 
 ## Dependencies
 
 - Python 3.10+
-- `pywebview>=4.0` — native desktop window with web UI
-- `playwright>=1.40` — browser automation (only for DeepSeek)
+- `pywebview>=4.0` — native desktop window with a web UI
+- `playwright>=1.40` — browser automation and CDP connection

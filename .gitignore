@@ -24,6 +24,7 @@ SOURCE/
 # Internal agent docs / session plans (not part of the product)
 AGENTS.md
 .opencode/plans/
+.anchored_summary.md
 
 # Experimental raw responses
 raw_responses/

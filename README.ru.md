@@ -2,6 +2,8 @@
 
 # AI Chat Exporter
 
+> *Личный open-source проект. Создан в первую очередь для себя и опубликован на случай, если окажется полезен другим.*
+
 ![AI Chat Exporter](ui/splash.png)
 
 Десктопное приложение для экспорта диалогов AI (**ChatGPT, Gemini, Claude, Qwen, DeepSeek**) в локальные Markdown-файлы.
