@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.4 — Help text fix (2026-08-12)
+
+### Changed
+- **Help/About**: убран устаревший абзац про DeepSeek («подключается отдельным окном»). DeepSeek, как и остальные сервисы, открывается во вкладке общего окна Chrome.
+
+---
+
 ## v0.5.3 — CDP startup fix, updated Help (2026-08-12)
 
 ### Fixed

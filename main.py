@@ -326,7 +326,7 @@ def _check_cdp_alive():
 
 # ── App version + update check (GitHub Releases only) ──
 
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 REPO_OWNER = "Nordggs"
 REPO_NAME = "Projekt_AI_Base"
 

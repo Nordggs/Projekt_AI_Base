@@ -1,5 +1,5 @@
 #define MyAppName "AI Chat Exporter"
-#define MyAppVersion "0.5.3"
+#define MyAppVersion "0.5.4"
 #define MyAppPublisher "Nordggs"
 #define MyAppExeName "AIChatExporter.exe"
 
