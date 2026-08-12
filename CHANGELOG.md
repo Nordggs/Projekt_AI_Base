@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5.3 — CDP startup fix, updated Help (2026-08-12)
+
+### Fixed
+- **Chrome «мелькает и падает» при нажатии «Запустить Chrome»**: битый V8 `Code Cache` в профиле (`~/.ai_pipeline/chrome_gemini\Default\Code Cache`, повреждался при `taskkill /F`) вызывал мгновенный вылет Chromium. `CDPManager.start()` теперь:
+  - делает до 2 попыток запуска;
+  - при неудаче чистит повреждённые кэши (`Code Cache`, `GPUCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `GrShaderCache`, `ShaderCache`, `GraphiteDawnCache`) и повторяет;
+  - перебирает кандидатов Chrome: bundled (`ms-playwright`) → системный (`Program Files`);
+  - если CDP endpoint `127.0.0.1:9222` уже занят живым Chrome (single-instance), не запускает второй экземпляр, а переиспользует существующий.
+- **Асинхронный запуск CDP**: `launch_chrome_cdp()` не блокирует UI — работает в фоновом потоке; ошибки идут в `logs/app.log` + UI-журнал.
+- **Подробные логи CDP**: `[CDP] launching …`, `exited immediately`, `purged corrupt caches …`, `Chrome ready` — в UI-журнале и `logs/app.log`.
+
+### Changed
+- **Help/About обновлён**: обязательный первый шаг «Запустить Chrome», блок «Важно: если Chrome/CDP не запущен…», отдельная инструкция для DeepSeek.
+
+---
+
 ## v0.5.2 — Update check, Help/About, Sync Summary, no-console GUI (2026-08-12)
 
 ### New

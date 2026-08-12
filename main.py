@@ -326,7 +326,7 @@ def _check_cdp_alive():
 
 # ── App version + update check (GitHub Releases only) ──
 
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 REPO_OWNER = "Nordggs"
 REPO_NAME = "Projekt_AI_Base"
 
@@ -447,7 +447,15 @@ class App:
         self._claude_session_epoch = 0
 
         # CDP Manager — единый Chrome для всех провайдеров
-        self.cdp = CDPManager(log=self.log)
+        self._file_log = None
+        try:
+            _logs_dir = os.path.join(self._storage_dir, "logs")
+            os.makedirs(_logs_dir, exist_ok=True)
+            self._file_log = _FileLogWriter(os.path.join(_logs_dir, "app.log"))
+        except OSError:
+            pass
+        self.cdp = CDPManager(log=self.log, file_log=self._file_log)
+        self._cdp_start_thread = None
 
         threading.Thread(target=self._gw_worker, daemon=True).start()
 
@@ -1557,11 +1565,23 @@ class App:
         self._push_summary(msg)
 
     def launch_chrome_cdp(self):
-        if self.cdp.healthcheck():
-            self.log.add("[INFO] CDP alive — force restart Chrome session")
-            self._close_cdp_browser()
-            time_module.sleep(2)
-        self.cdp.start()
+        prev = self._cdp_start_thread
+        if prev is not None and prev.is_alive():
+            self.log.add("[CDP] startup already in progress")
+            return "OK"
+
+        def _worker():
+            try:
+                if self.cdp.healthcheck():
+                    self.log.add("[INFO] CDP alive — force restart Chrome session")
+                    self._close_cdp_browser()
+                    time_module.sleep(2)
+                self.cdp.start()
+            except Exception as e:
+                self.log.add(f"[CDP] FAILED: {e}")
+
+        self._cdp_start_thread = threading.Thread(target=_worker, daemon=True)
+        self._cdp_start_thread.start()
         return "OK"
 
     # ── Session restore on startup ──
