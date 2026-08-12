@@ -27,6 +27,48 @@
     </div>
   </div>
 
+  <!-- ABOUT MODAL -->
+  <div id="aboutModal" class="modal hidden">
+    <div class="modal-content about-content">
+      <h3>AI Chat Exporter</h3>
+      <div class="about-version" id="aboutVersion">v0.5.2</div>
+      <p>Экспорт диалогов из ChatGPT, Gemini, Claude, Qwen и DeepSeek в Markdown.</p>
+      <h4>Как пользоваться</h4>
+      <ol>
+        <li>Нажмите Connect у нужного сервиса.</li>
+        <li>Войдите в свой аккаунт в открывшемся окне.</li>
+        <li>Нажмите Export или «Синхронизировать всё».</li>
+        <li>Готовые файлы лежат в папке экспорта (см. верхнюю панель).</li>
+      </ol>
+      <h4>Папка экспорта</h4>
+      <p>Путь показан в верхней части приложения. «Изменить…» выбирает другую папку, «Открыть» открывает её в Проводнике.</p>
+      <div class="about-links">
+        <a href="#" onclick="openExternal('https://github.com/Nordggs/Projekt_AI_Base'); return false;">GitHub</a> ·
+        <a href="#" onclick="openExternal('https://github.com/Nordggs/Projekt_AI_Base/releases'); return false;">Releases</a> ·
+        <a href="#" onclick="openExternal('https://github.com/Nordggs/Projekt_AI_Base/blob/master/LICENSE'); return false;">License</a>
+      </div>
+      <div class="modal-actions">
+        <button class="cancel" onclick="closeAbout()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- UPDATE MODAL -->
+  <div id="updateModal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Доступна новая версия</h3>
+      <p>
+        Текущая: <span id="updCurrent"></span><br />
+        Новая: <span id="updLatest"></span>
+      </p>
+      <p>Исправления и улучшения доступны на GitHub.</p>
+      <div class="modal-actions">
+        <button class="primary" onclick="openUpdateRelease()">Открыть страницу релиза</button>
+        <button class="cancel" onclick="closeUpdate()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <div class="app">
 
     <!-- TOP BAR -->
@@ -39,6 +81,7 @@
       <button class="sync-all" onclick="syncAll()">
         Синхронизировать всё
       </button>
+      <button class="icon-btn" onclick="openAbout()" title="О программе">?</button>
     </div>
 
     <!-- OUTPUT DIRECTORY (global export destination) -->
@@ -244,7 +287,10 @@
       <pre id="log"></pre>
     </div>
 
-    <div class="version">v0.5.1</div>
+    <div class="version">
+      <span id="versionText">v0.5.2</span>
+      <button id="updateBadge" class="update-badge hidden" onclick="showUpdateModal()" title=""></button>
+    </div>
 
   </div>
 

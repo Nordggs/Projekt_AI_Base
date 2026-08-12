@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.2 — Update check, Help/About, Sync Summary, no-console GUI (2026-08-12)
+
+### New
+- **Уведомление о новой версии**: тихая фоновая проверка GitHub Releases (`releases/latest`, сравнение `tag_name`), зелёная точка `●` при наличии более новой **стабильной** версии (draft/prerelease игнорируются), окно с кнопкой «Открыть страницу релиза». Без автообновления. Источник истины — `APP_VERSION` в `main.py`.
+- **Help/About**: кнопка «?» в верхней панели — краткая инструкция, папка экспорта, ссылки GitHub/Releases/License (открываются в браузере по умолчанию).
+- **Финальный Summary операции**: после каждого провайдера (`✓ Qwen: завершено — 20 чатов, 150 сообщений, ошибок: 0`) и после «Синхронизировать всё» (`Готово: 5 провайдеров · 136 чатов · 6 676 сообщений · ошибок: 0` + partial/пропущено) — итоговая строка в логе. Кнопка «Синхронизировать всё» разблокируется только после полного завершения.
+
+### Changed
+- **GUI build без консоли**: репозиторный `AIChatExporter.spec` (`console=False`, onedir, `collect_all` playwright/pywebview, `excludes=PyQt5`). Сборка: `pyinstaller AIChatExporter.spec --distpath dist --workpath build`.
+- **stdout/stderr → `logs/app.log`**: все traceback (включая pywebview `_call` и Playwright-колбэки) сохраняются рядом с ui_session-логами; `sys.excepthook` — туда же. Для пользователя ошибки остаются в UI-журнале.
+- **`webview.FOLDER_DIALOG` → `webview.FileDialog.FOLDER`** — устранён deprecation warning.
+- `_do_sync_all` теперь дожидается завершения всех провайдеров через `threading.Event` (итог и сброс кнопки — только после).
+
+### Fixed
+- **`greenlet.error: cannot switch to a different thread`** — все операции с Playwright (закрытие страниц, `window.stop()`, `page.close()`, `pw.close()`) вынесены из UI/pywebview-потока в владеющие worker-очереди (`soft_stop`/`close_cdp` команды). Аудит cross-thread вызовов (`reconnect_gemini`, `_close_cdp_browser`, `_soft_stop`, `_is_page_alive` в `add_gemina_account`).
+
+---
+
 ## v0.5.1 — Output directory selection (2026-08-12)
 
 ### New

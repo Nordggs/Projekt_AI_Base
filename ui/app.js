@@ -11,6 +11,10 @@ function log(msg) {
   renderLog(`[UI] ${msg}`);
 }
 
+function pushSummary(msg) {
+  renderLog(`─── ${msg} ───`);
+}
+
 function setBridgeStatus(status) {
   document.getElementById("bridgeStatus").textContent = status;
   if (status === "ready" || status === "connected") {
@@ -100,6 +104,64 @@ function submitAccount() {
       }
     );
   }
+}
+
+// ── Version / Update / About ──
+
+var _lastUpdate = null;
+
+function openExternal(url) {
+  if (window.pywebview && url) {
+    window.pywebview.api.open_external(url);
+  }
+}
+
+function refreshVersion() {
+  if (!window.pywebview) return;
+  window.pywebview.api.get_version().then(function(v) {
+    var el = document.getElementById("versionText");
+    if (el && v) el.textContent = "v" + v.current;
+    var about = document.getElementById("aboutVersion");
+    if (about && v) about.textContent = "v" + v.current;
+  }).catch(function() {});
+}
+
+function checkForUpdate() {
+  if (!window.pywebview) return;
+  window.pywebview.api.check_update().then(function(res) {
+    _lastUpdate = res;
+    if (res && res.available) {
+      var badge = document.getElementById("updateBadge");
+      if (badge) {
+        badge.classList.remove("hidden");
+        badge.title = "Доступна новая версия " + res.latest;
+      }
+    }
+  }).catch(function() {});
+}
+
+function showUpdateModal() {
+  if (!_lastUpdate || !_lastUpdate.available) return;
+  document.getElementById("updCurrent").textContent = "v" + _lastUpdate.current;
+  document.getElementById("updLatest").textContent = _lastUpdate.latest;
+  document.getElementById("updateModal").classList.remove("hidden");
+}
+
+function closeUpdate() {
+  document.getElementById("updateModal").classList.add("hidden");
+}
+
+function openUpdateRelease() {
+  if (_lastUpdate && _lastUpdate.url) openExternal(_lastUpdate.url);
+  closeUpdate();
+}
+
+function openAbout() {
+  document.getElementById("aboutModal").classList.remove("hidden");
+}
+
+function closeAbout() {
+  document.getElementById("aboutModal").classList.add("hidden");
 }
 
 // ── Stop / Cancel ──
@@ -786,6 +848,8 @@ document.addEventListener("DOMContentLoaded", function() {
   setTimeout(fadeSplash, 2500);
   setTimeout(refreshCdpStatus, 500);
   setTimeout(refreshOutputDir, 300);
+  setTimeout(refreshVersion, 400);
+  setTimeout(checkForUpdate, 2000);
 
   // Qwen DnD fix for pywebview — explicit event handlers for textarea
   const qw = document.getElementById("qwUrls");

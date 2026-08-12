@@ -59,6 +59,50 @@ def _resolve_storage():
         return fb, os.path.join(fb, "config.json")
 
 
+class _FileLogWriter:
+    """Safe tee for stdout/stderr -> file. Tolerant to None/MSVCrt + flush() contracts."""
+
+    def __init__(self, path):
+        self._f = open(path, "a", encoding="utf-8", errors="replace")
+
+    def write(self, data):
+        try:
+            self._f.write(str(data))
+            self._f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._f.flush()
+        except Exception:
+            pass
+
+
+def _install_stderr_logging():
+    """Redirect stdout/stderr and excepthook to storage logs/app.log (no console in frozen GUI)."""
+    try:
+        storage, _ = _resolve_storage()
+        logs_dir = os.path.join(storage, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        w = _FileLogWriter(os.path.join(logs_dir, "app.log"))
+        if sys.stdout is not None:
+            sys.stdout = w
+        if sys.stderr is not None:
+            sys.stderr = w
+
+        def _hook(tp, val, tb):
+            try:
+                import traceback
+                w.write("".join(traceback.format_exception(tp, val, tb)) + "\n")
+            except Exception:
+                pass
+
+        sys.excepthook = _hook
+    except Exception:
+        pass
+
+
 @dataclass
 class CaptureContext:
     cdp_assets: list = field(default_factory=list)
@@ -251,13 +295,25 @@ class API:
         return self._app.get_output_dir()
 
     def choose_output_dir(self):
-        result = self._app.window.create_file_dialog(webview.FOLDER_DIALOG)
+        result = self._app.window.create_file_dialog(webview.FileDialog.FOLDER)
         if result and result[0]:
             return self._app.set_output_dir(result[0])
         return self._app.get_output_dir()
 
     def open_output_dir(self):
         return self._app.open_output_dir()
+
+    def get_version(self):
+        return self._app.get_version()
+
+    def check_update(self):
+        return self._app.check_update()
+
+    def open_external(self, url):
+        if isinstance(url, str) and url.startswith("http"):
+            import webbrowser
+            webbrowser.open(url)
+        return "OK"
 
 
 def _check_cdp_alive():
@@ -266,6 +322,41 @@ def _check_cdp_alive():
             return "webSocketDebuggerUrl" in json.load(r)
     except Exception:
         return False
+
+
+# ── App version + update check (GitHub Releases only) ──
+
+APP_VERSION = "0.5.2"
+REPO_OWNER = "Nordggs"
+REPO_NAME = "Projekt_AI_Base"
+
+
+def _version_tuple(v):
+    parts = []
+    for p in str(v).lstrip("v").replace("-", ".").split("."):
+        if p.isdigit():
+            parts.append(int(p))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+def _fetch_latest_release():
+    try:
+        with urllib.request.urlopen(
+            f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest",
+            timeout=8,
+        ) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    if data.get("draft") or data.get("prerelease"):
+        return None
+    tag = (data.get("tag_name") or "").strip()
+    url = (data.get("html_url") or "").strip()
+    if not tag:
+        return None
+    return {"tag": tag, "url": url}
 
 
 class App:
@@ -293,6 +384,8 @@ class App:
             "gemini": "idle", "qwen": "idle",
             "chatgpt": "idle", "claude": "idle", "deepseek": "idle",
         }
+        self._sync_done_events = {}
+        self._sync_results = {}
 
         # Playwright actor: single-thread queue
         self._pw_queue = queue.Queue()
@@ -302,6 +395,8 @@ class App:
         self._export_active = False
         self._cancel_flag = False
         self._cancel_version = 0
+        self._close_pw_done = threading.Event()
+        self._close_gw_done = threading.Event()
 
         # Output storage: dev → project dir; frozen → next to exe (portable),
         # fallback to %LOCALAPPDATA%\AIChatExporter when exe dir is not writable (installed).
@@ -409,10 +504,9 @@ class App:
             raise Cancelled()
 
     def _soft_stop(self):
-        for page in [self.qwen_page, self.gemini_page, self.chatgpt_page, self.claude_page, self.pw.page if self.pw else None]:
+        for q in (self._pw_queue, self._gw_queue):
             try:
-                if page:
-                    page.evaluate("window.stop()")
+                q.put(("soft_stop", ""))
             except Exception:
                 pass
 
@@ -501,12 +595,30 @@ class App:
             try:
                 if cmd == "connect":       self._do_connect(arg)
                 elif cmd == "reconnect":   self._do_reconnect()
+                elif cmd == "soft_stop":
+                    if self.pw and self.pw.page:
+                        try:
+                            self.pw.page.evaluate("window.stop()")
+                        except Exception:
+                            pass
+                elif cmd == "close_cdp":
+                    try:
+                        if self.pw:
+                            self.pw.close()
+                    except Exception:
+                        pass
+                    self.pw = None
+                    self._close_pw_done.set()
                 elif cmd == "export_provider":
                     name, urls = arg
                     try:
-                        self._export_provider(name, urls)
+                        res = self._export_provider(name, urls)
+                        self._sync_results[name] = res or {"provider": name}
                     finally:
                         self._export_active = False
+                        ev = self._sync_done_events.pop(name, None)
+                        if ev:
+                            ev.set()
             except Exception as e:
                 self.log.add(f"[ERROR] _pw_worker cmd={cmd}: {e}")
                 self._push_log(f"ERR: {e}")
@@ -531,16 +643,40 @@ class App:
 
             try:
                 if cmd == "connect_gemini":      self._do_connect_gemini(arg)
+                elif cmd == "soft_stop":
+                    for page in [self.qwen_page, self.gemini_page, self.chatgpt_page, self.claude_page]:
+                        try:
+                            if page:
+                                page.evaluate("window.stop()")
+                        except Exception:
+                            pass
+                elif cmd == "close_cdp":
+                    for page in [self.gemini_page, self.qwen_page, self.chatgpt_page, self.claude_page]:
+                        try:
+                            if page:
+                                page.close()
+                        except Exception:
+                            pass
+                    try:
+                        if self._gw_browser:
+                            self._gw_browser.close()
+                    except Exception:
+                        pass
+                    self._close_gw_done.set()
                 elif cmd == "export_provider":
                     name, urls = arg
                     try:
-                        self._export_provider(name, urls)
+                        res = self._export_provider(name, urls)
+                        self._sync_results[name] = res or {"provider": name}
                     finally:
                         reset = {"gemini": "_gemini_export_active", "qwen": "_qwen_export_active",
                                  "chatgpt": "_chatgpt_export_active", "claude": "_claude_export_active"}
                         flag = reset.get(name)
                         if flag:
                             setattr(self, flag, False)
+                        ev = self._sync_done_events.pop(name, None)
+                        if ev:
+                            ev.set()
                 elif cmd == "connect_qwen":
                     with self._cdp_lock:
                         self._do_connect_qwen()
@@ -704,11 +840,14 @@ class App:
         return fn()
 
     def _export_provider(self, name, urls=None):
+        display = {"chatgpt": "ChatGPT", "deepseek": "DeepSeek", "gemini": "Gemini",
+                   "qwen": "Qwen", "claude": "Claude"}.get(name, name.title())
         lock = self._locks[name]
         if not lock.acquire(blocking=False):
             self.log.add(f"[WARN] {name} sync BUSY")
             self._push_log(f"{name} BUSY")
-            return
+            return {"provider": name, "busy": True, "chats": 0, "ok": 0, "errors": 0,
+                    "partial": 0, "messages": 0, "skipped": 0}
 
         self.set_sync_state(name, "running")
         self.log.add(f"[{name.upper()}] batch start urls={urls}")
@@ -716,6 +855,8 @@ class App:
         self._push_log(f"[INFO] {name.title()}: output dir → {self._output_dir}")
         writer = ExportWriter(out_dir=self._output_dir)
 
+        result = {"provider": name, "chats": 0, "ok": 0, "errors": 0,
+                  "partial": 0, "messages": 0, "skipped": 0, "cancelled": False, "error": None}
         try:
             if urls:
                 chats = [{"url": u} for u in dict.fromkeys(urls)]
@@ -733,6 +874,10 @@ class App:
                 raise RuntimeError(f"No {name} chat URLs found")
 
             self.log.add(f"[{name.upper()}] batch: {len(chats)} chats")
+            result["chats"] = len(chats)
+            errors = 0
+            partial = 0
+            messages_total = 0
             results = []
 
             for idx, chat in enumerate(chats):
@@ -758,11 +903,13 @@ class App:
 
                 ok = adapter.open_chat(chat)
                 if not ok:
+                    errors += 1
                     self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: not found")
                     continue
 
                 model = adapter.extract_chat(chat)
                 if not model:
+                    errors += 1
                     self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: no data")
                     continue
 
@@ -771,6 +918,8 @@ class App:
                     model, ctx.cdp_assets, ctx.runtime, ctx.anchor,
                     log_func=self._push_log,
                 )
+                if enrich_stats.partial:
+                    partial += 1
                 if ctx.cdp_assets or ctx.runtime.blobs:
                     writer.flush_media(model)
                     self.log.add(f"[{name.upper()}] enrich: cdp={enrich_stats.cdp_strict + enrich_stats.cdp_temporal} runtime={enrich_stats.runtime} partial={enrich_stats.partial}")
@@ -779,15 +928,21 @@ class App:
                 if path:
                     n = len(model.messages)
                     results.append({"ok": True, "path": str(path), "count": n})
+                    messages_total += n
                     self.log.add(f"[OK] {name.title()} [{idx+1}/{len(chats)}] → {path}")
                     self._push_log(f"[OK] {name.title()} [{idx+1}/{len(chats)}] → {path}")
                 else:
+                    errors += 1
                     self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: write failed")
 
-            total = sum(r["count"] for r in results) if results else 0
+            result["ok"] = len(results)
+            result["errors"] = errors
+            result["partial"] = partial
+            result["messages"] = messages_total
+            result["skipped"] = max(0, len(chats) - len(results) - errors)
             self.set_sync_state(name, "done")
-            self.log.add(f"[INFO] {name} batch done: {total} msgs from {len(results)}/{len(chats)} chats")
-            self._push_log(f"{name} batch: {total} msgs — {len(results)}/{len(chats)}")
+            self.log.add(f"[INFO] {name} batch done: {messages_total} msgs from {len(results)}/{len(chats)} chats")
+            self._per_provider_summary(display, result)
             try:
                 self.window.evaluate_js("copyLogContent()")
             except Exception:
@@ -795,16 +950,29 @@ class App:
 
         except Cancelled:
             self.set_sync_state(name, "failed")
+            result["cancelled"] = True
             self.log.add(f"[INFO] {name} batch cancelled by user")
             self._push_log(f"⏹ {name} sync cancelled")
+            self._push_summary(f"⏹ {display}: прервано — {result['ok']}/{result['chats']} чатов, {result['messages']} сообщений")
         except Exception as e:
             self.set_sync_state(name, "failed")
+            result["error"] = str(e)
             self.log.add(f"[ERROR] {name}: {e}")
             self._push_log(f"{name} ERR: {e}")
+            self._push_summary(f"✗ {display}: ошибка — {e}")
         finally:
             self._cancel_flag = False
             self._cancel_version = 0
             lock.release()
+        return result
+
+    def _per_provider_summary(self, display, result):
+        parts = [f"✓ {display}: завершено — {result['ok']} чатов, {result['messages']} сообщений, ошибок: {result['errors']}"]
+        if result.get("partial"):
+            parts.append(f"partial: {result['partial']}")
+        if result.get("skipped"):
+            parts.append(f"пропущено: {result['skipped']}")
+        self._push_summary(" · ".join(parts))
 
 
     # ── Qwen (CDP page in same browser as Gemini) ──
@@ -1242,7 +1410,7 @@ class App:
             self._gw_queue.put(("connect_gemini", url))
             if not self._connect_gemini_done.wait(timeout=30):
                 raise RuntimeError("Gemini CDP connection timeout")
-            if not self.gemini_page or not self._is_page_alive(self.gemini_page):
+            if not self.gemini_page or self._gemini_connect_state != "connected":
                 raise RuntimeError("Gemini not actually connected")
             self._gemini_connect_state = "connected"
             return "OK"
@@ -1268,28 +1436,24 @@ class App:
         self._gemini_connect_state = "idle"
         try:
             self.log.add("[INFO] Reconnecting Gemini...")
-            if self.gemini_page:
-                try:
-                    self.gemini_page.close()
-                except Exception:
-                    pass
-                self.gemini_page = None
-            self.add_gemini_account("cdp")
+            self.add_gemina_account("cdp")
         finally:
             self._gemini_connect_lock = False
 
     def _close_cdp_browser(self):
         self.log.add("[CDP] Closing browser session...")
-        for page in [self.gemini_page, self.qwen_page, self.chatgpt_page, self.claude_page]:
-            try:
-                if page: page.close()
-            except Exception:
-                pass
-        if self.pw:
-            try:
-                self.pw.close()
-            except Exception:
-                pass
+        self._close_pw_done.clear()
+        self._close_gw_done.clear()
+        try:
+            self._pw_queue.put(("close_cdp", "pw"))
+        except Exception:
+            self._close_pw_done.set()
+        try:
+            self._gw_queue.put(("close_cdp", "gw"))
+        except Exception:
+            self._close_gw_done.set()
+        self._close_pw_done.wait(timeout=20)
+        self._close_gw_done.wait(timeout=20)
         self.cdp.stop()
         self._gw_browser = None
         self.gemini_page = None
@@ -1340,23 +1504,57 @@ class App:
             self.window.evaluate_js("setSyncRunning(true)")
         except Exception:
             pass
-        self.log.add("[INFO] Sync All — последовательно: ChatGPT → Gemini → Claude → Qwen → DeepSeek")
+        self.log.add("[INFO] Sync All — ChatGPT → Gemini → Claude → Qwen → DeepSeek")
         order = ["chatgpt", "gemini", "claude", "qwen", "deepseek"]
+        events = {}
         for name in order:
             if not self._is_provider_connected(name):
                 continue
+            ev = threading.Event()
+            self._sync_done_events[name] = ev
+            events[name] = ev
             self.log.add(f"[SYNC] Старт {name}...")
             try:
                 q = self._pw_queue if name == "deepseek" else self._gw_queue
                 q.put(("export_provider", (name, [])))
             except Exception as e:
-                self.log.add(f"[ERROR] {name}: {e}")
+                self._sync_done_events.pop(name, None)
+                self._sync_results[name] = {"provider": name, "error": str(e)}
                 self.set_sync_state(name, "failed")
-        self.log.add(f"[INFO] Sync All — выполнено")
+                ev.set()
+
+        for name, ev in events.items():
+            ev.wait(timeout=600)
+            if not ev.is_set():
+                self._sync_results.setdefault(name, {"provider": name, "error": "timeout"})
+
+        results = [self._sync_results.get(name, {"provider": name}) for name in events]
+        self._emit_sync_all_summary(results)
+        self.log.add("[INFO] Sync All — выполнено")
         try:
             self.window.evaluate_js("setSyncRunning(false)")
         except Exception:
             pass
+
+    def _emit_sync_all_summary(self, results):
+        providers = len(results)
+        chats = sum(r.get("chats", 0) for r in results)
+        messages = sum(r.get("messages", 0) for r in results)
+        errors = sum(r.get("errors", 0) for r in results)
+        partial = sum(r.get("partial", 0) for r in results)
+        skipped = sum(r.get("skipped", 0) for r in results)
+        if any(r.get("cancelled") for r in results):
+            msg = f"⏹ Прервано: {providers} провайдеров · {chats} чатов · {messages} сообщений"
+        else:
+            msg = f"Готово: {providers} провайдеров · {chats} чатов · {messages} сообщений · ошибок: {errors}"
+            extra = []
+            if partial:
+                extra.append(f"partial: {partial}")
+            if skipped:
+                extra.append(f"пропущено: {skipped}")
+            if extra:
+                msg += " · " + " · ".join(extra)
+        self._push_summary(msg)
 
     def launch_chrome_cdp(self):
         if self.cdp.healthcheck():
@@ -1447,10 +1645,34 @@ class App:
             os.startfile(self._output_dir)
         return self._output_dir
 
+    def get_version(self):
+        return {"current": APP_VERSION}
+
+    def check_update(self):
+        current = APP_VERSION
+        rel = _fetch_latest_release()
+        if not rel:
+            return {"available": False, "current": current}
+        if _version_tuple(rel["tag"]) > _version_tuple(current):
+            return {
+                "available": True,
+                "current": current,
+                "latest": rel["tag"],
+                "url": rel["url"],
+            }
+        return {"available": False, "current": current}
+
     def _push_log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         try:
             self.window.evaluate_js(f"pushLog({json.dumps(f'[{ts}] {msg}')})")
+        except Exception:
+            pass
+
+    def _push_summary(self, msg):
+        self.log.add(f"[SUMMARY] {msg}")
+        try:
+            self.window.evaluate_js(f"pushSummary({json.dumps(msg)})")
         except Exception:
             pass
 
@@ -1460,5 +1682,6 @@ if __name__ == "__main__":
     bundled_browsers = os.path.join(exe_dir, "ms-playwright")
     if os.path.isdir(bundled_browsers):
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bundled_browsers
+    _install_stderr_logging()
     app = App()
     webview.start(debug=False, icon='ui/icon.ico')
