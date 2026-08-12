@@ -15,6 +15,7 @@
 - Gemini: устранена гонка перезагрузки между экспортами (34/34)
 - Qwen: устранены обе регрессии — ложный preflight и привязка чат ↔ файл (20/20)
 - ChatGPT 28/28, DeepSeek 66/66, Claude 8/8 — контрольные прогоны
+- **Portable/Setup**: `AIChatExporter.exe.config` с `<loadFromRemoteSources enabled="true"/>` — устранён краш `Failed to resolve Python.Runtime.Loader.Initialize` при запуске из ZIP, скачанного через браузер (Mark-of-the-Web)
 
 ### Changed
 - `debug=True` → `False` в `webview.start()` (релизный запуск)

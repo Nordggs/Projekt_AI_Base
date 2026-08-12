@@ -32,6 +32,9 @@ raw_responses/
 # Local dev helpers
 run-main.bat
 
+# Unpacked downloads / test extractions
+AIChatExporter-Portable-*/
+
 # Build artifacts
 build-venv/
 build/
