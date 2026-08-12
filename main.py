@@ -328,7 +328,7 @@ def _check_cdp_alive():
 
 APP_VERSION = "0.5.4"
 REPO_OWNER = "Nordggs"
-REPO_NAME = "Projekt_AI_Base"
+REPO_NAME = "Project_AI_Base"
 
 
 def _version_tuple(v):

@@ -19,8 +19,8 @@
 
 ## Скачать
 
-- **[AIChatExporter-Setup-0.5.0.exe](https://github.com/Nordggs/Projekt_AI_Base/releases)** — установщик с ярлыками Desktop и Start Menu (рекомендуется)
-- **[AIChatExporter-Portable-0.5.0.zip](https://github.com/Nordggs/Projekt_AI_Base/releases)** — портативная сборка, работает без установки
+- **[AIChatExporter-Setup-0.5.0.exe](https://github.com/Nordggs/Project_AI_Base/releases)** — установщик с ярлыками Desktop и Start Menu (рекомендуется)
+- **[AIChatExporter-Portable-0.5.0.zip](https://github.com/Nordggs/Project_AI_Base/releases)** — портативная сборка, работает без установки
 
 ## Установка
 

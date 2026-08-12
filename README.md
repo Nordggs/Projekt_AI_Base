@@ -19,8 +19,8 @@ No API keys, no cloud services, no HTTP server.
 
 ## Download
 
-- **[AIChatExporter-Setup-0.5.0.exe](https://github.com/Nordggs/Projekt_AI_Base/releases)** — installer with Desktop and Start Menu shortcuts (recommended)
-- **[AIChatExporter-Portable-0.5.0.zip](https://github.com/Nordggs/Projekt_AI_Base/releases)** — portable build, no installation required
+- **[AIChatExporter-Setup-0.5.0.exe](https://github.com/Nordggs/Project_AI_Base/releases)** — installer with Desktop and Start Menu shortcuts (recommended)
+- **[AIChatExporter-Portable-0.5.0.zip](https://github.com/Nordggs/Project_AI_Base/releases)** — portable build, no installation required
 
 ## Installation
 
