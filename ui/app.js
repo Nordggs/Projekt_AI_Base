@@ -120,6 +120,39 @@ function resetStopButtons() {
   });
 }
 
+// ── Output directory ──
+
+function refreshOutputDir() {
+  if (!window.pywebview) return;
+  window.pywebview.api.get_output_dir().then(function(path) {
+    const el = document.getElementById("outputDirPath");
+    if (!el) return;
+    el.textContent = path;
+    el.title = path;
+    renderLog(`[INFO] Output directory: ${path}`);
+  });
+}
+
+function chooseOutputDir() {
+  log("choosing output directory...");
+  if (window.pywebview) {
+    window.pywebview.api.choose_output_dir().then(function(path) {
+      refreshOutputDir();
+      log("output directory: " + path);
+    }, function(err) {
+      log("choose output dir failed: " + err);
+    });
+  }
+}
+
+function openOutputDir() {
+  if (window.pywebview) {
+    window.pywebview.api.open_output_dir().then(function() {}, function(err) {
+      log("open output dir failed: " + err);
+    });
+  }
+}
+
 // ── CDP Bar ──
 
 function refreshCdpStatus() {
@@ -752,6 +785,7 @@ function reconnectClaude() {
 document.addEventListener("DOMContentLoaded", function() {
   setTimeout(fadeSplash, 2500);
   setTimeout(refreshCdpStatus, 500);
+  setTimeout(refreshOutputDir, 300);
 
   // Qwen DnD fix for pywebview — explicit event handlers for textarea
   const qw = document.getElementById("qwUrls");

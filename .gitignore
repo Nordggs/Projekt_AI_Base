@@ -13,6 +13,9 @@ raw/
 # Logs
 logs/
 
+# Local runtime settings (dev runs)
+config.json
+
 # Release backups
 release/
 

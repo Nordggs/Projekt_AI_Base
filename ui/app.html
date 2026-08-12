@@ -41,6 +41,14 @@
       </button>
     </div>
 
+    <!-- OUTPUT DIRECTORY (global export destination) -->
+    <div class="output-bar">
+      <span class="output-label">Папка экспорта:</span>
+      <span class="output-path" id="outputDirPath" title=""></span>
+      <button class="small" onclick="chooseOutputDir()">Изменить…</button>
+      <button class="small" onclick="openOutputDir()">Открыть</button>
+    </div>
+
     <!-- CDP BAR (global infrastructure status) -->
     <div id="cdpBar" class="cdp-bar">
       <span class="cdp-label" id="cdpIndicator">🔗 CDP: <span class="status-dot dot-off">○</span> не запущен</span>
@@ -236,7 +244,7 @@
       <pre id="log"></pre>
     </div>
 
-    <div class="version">v0.4.0</div>
+    <div class="version">v0.5.1</div>
 
   </div>
 

@@ -34,6 +34,31 @@ def _resolve_ui_url():
     return "ui/app.html"
 
 
+def _resolve_storage():
+    """Resolve storage dir for config.json: next to exe (portable) when writable,
+    otherwise %LOCALAPPDATA%\\AIChatExporter (installed)."""
+    if getattr(sys, "frozen", False):
+        primary = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        primary = os.getcwd()
+    config = os.path.join(primary, "config.json")
+    try:
+        os.makedirs(primary, exist_ok=True)
+        if not os.path.exists(config):
+            tmp = config + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("{}")
+            os.replace(tmp, config)
+        return primary, config
+    except OSError:
+        fb = os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+            "AIChatExporter",
+        )
+        os.makedirs(fb, exist_ok=True)
+        return fb, os.path.join(fb, "config.json")
+
+
 @dataclass
 class CaptureContext:
     cdp_assets: list = field(default_factory=list)
@@ -222,6 +247,18 @@ class API:
             f.write(trimmed)
         return path
 
+    def get_output_dir(self):
+        return self._app.get_output_dir()
+
+    def choose_output_dir(self):
+        result = self._app.window.create_file_dialog(webview.FOLDER_DIALOG)
+        if result and result[0]:
+            return self._app.set_output_dir(result[0])
+        return self._app.get_output_dir()
+
+    def open_output_dir(self):
+        return self._app.open_output_dir()
+
 
 def _check_cdp_alive():
     try:
@@ -265,13 +302,19 @@ class App:
         self._export_active = False
         self._cancel_flag = False
         self._cancel_version = 0
-        self._output_folders = {
-            "deepseek": "raw",
-            "chatgpt": "raw",
-            "gemini": "raw",
-            "claude": "raw",
-            "qwen": "raw",
-        }
+
+        # Output storage: dev → project dir; frozen → next to exe (portable),
+        # fallback to %LOCALAPPDATA%\AIChatExporter when exe dir is not writable (installed).
+        self._storage_dir, self._config_path = _resolve_storage()
+        self._output_dir = self._load_output_dir()
+        if self._output_dir is None:
+            self._output_dir = self._default_output_dir()
+            try:
+                self._save_output_dir(self._output_dir)
+            except OSError:
+                pass
+        os.makedirs(self._output_dir, exist_ok=True)
+        self.log.add(f"[INFO] Output directory: {self._output_dir}")
 
         threading.Thread(target=self._pw_worker, daemon=True).start()
 
@@ -669,7 +712,9 @@ class App:
 
         self.set_sync_state(name, "running")
         self.log.add(f"[{name.upper()}] batch start urls={urls}")
-        writer = ExportWriter(out_dir=self._output_folders[name])
+        self.log.add(f"[INFO] {name.title()}: output dir → {self._output_dir}")
+        self._push_log(f"[INFO] {name.title()}: output dir → {self._output_dir}")
+        writer = ExportWriter(out_dir=self._output_dir)
 
         try:
             if urls:
@@ -734,8 +779,8 @@ class App:
                 if path:
                     n = len(model.messages)
                     results.append({"ok": True, "path": str(path), "count": n})
-                    self.log.add(f"[{name.upper()}] [{idx+1}/{len(chats)}] {n} msgs -> {path.name}")
-                    self._push_log(f"{name} [{idx+1}/{len(chats)}] OK: {n} msgs")
+                    self.log.add(f"[OK] {name.title()} [{idx+1}/{len(chats)}] → {path}")
+                    self._push_log(f"[OK] {name.title()} [{idx+1}/{len(chats)}] → {path}")
                 else:
                     self._push_log(f"{name} [{idx+1}/{len(chats)}] ERR: write failed")
 
@@ -1356,9 +1401,51 @@ class App:
             return None
         n = len(model.messages)
         source = model.metadata.get("source", "?")
-        self.log.add(f"[SUCCESS] {label} {n} msgs ({source}) → {path.name}")
-        self._push_log(f"{label} OK: {n} msgs — {model.title}")
+        self.log.add(f"[SUCCESS] {label} {n} msgs ({source}) → {path}")
+        self._push_log(f"{label} OK: {n} msgs — {model.title} → {path}")
         return {"ok": True, "path": str(path), "count": n}
+
+    # ── Output directory ──
+
+    def _default_output_dir(self):
+        return os.path.join(self._storage_dir, "raw")
+
+    def _load_output_dir(self):
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            val = data.get("output_dir")
+            if val and isinstance(val, str):
+                return val
+        except Exception:
+            pass
+        return None
+
+    def _save_output_dir(self, path):
+        tmp = self._config_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"output_dir": path}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self._config_path)
+
+    def get_output_dir(self):
+        return self._output_dir
+
+    def set_output_dir(self, path):
+        os.makedirs(path, exist_ok=True)
+        self._output_dir = path
+        try:
+            self._save_output_dir(path)
+        except Exception as e:
+            self.log.add(f"[WARN] cannot save config: {e}")
+        self.log.add(f"[INFO] Output directory: {path}")
+        self._push_log(f"[INFO] Output directory: {path}")
+        return path
+
+    def open_output_dir(self):
+        os.makedirs(self._output_dir, exist_ok=True)
+        if os.name == "nt":
+            os.startfile(self._output_dir)
+        return self._output_dir
 
     def _push_log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")

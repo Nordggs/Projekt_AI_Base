@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.1 — Output directory selection (2026-08-12)
+
+### New
+- **Выбор папки экспорта**: строка «Папка экспорта» в верхней панели с кнопками «Изменить…» (системный диалог выбора папки) и «Открыть» (проводник)
+- **Запоминание выбора**: `config.json` рядом с exe (Portable) или в `%LOCALAPPDATA%\AIChatExporter\` (установленная версия, где exe-каталог не писабелен)
+- **Папка по умолчанию**: `<exe>/raw` (Portable) / `<LOCALAPPDATA>\AIChatExporter\raw` (installed), создаётся автоматически
+- **Полный путь в журнале**: при старте `[INFO] Output directory: …`, при экспорте `[OK] DeepSeek [1/20] → C:\…\raw\deepseek\….md`
+
+### Changed
+- Убран словарь `_output_folders` — единый корень вывода `App._output_dir`
+- Логи записи файлов показывают полный путь вместо имени файла
+
+---
+
 ## v0.5.0 — Stable release (2026-08-12)
 
 ### New
