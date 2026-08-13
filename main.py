@@ -283,8 +283,12 @@ class API:
         return self._app.log.get()
 
     def save_log(self):
-        os.makedirs("logs", exist_ok=True)
-        path = f"logs/debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logs_dir = os.path.join(self._app._storage_dir, "logs")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except OSError:
+            logs_dir = os.getcwd()
+        path = os.path.join(logs_dir, f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         lines = self._app.log.get().splitlines()
         trimmed = "\n".join(lines[-200:])
         with open(path, "w", encoding="utf-8") as f:
@@ -326,7 +330,7 @@ def _check_cdp_alive():
 
 # ── App version + update check (GitHub Releases only) ──
 
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 REPO_OWNER = "Nordggs"
 REPO_NAME = "Project_AI_Base"
 
@@ -460,13 +464,19 @@ class App:
         threading.Thread(target=self._gw_worker, daemon=True).start()
 
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.ui_log_path = f"logs/ui_session_{self.session_id}.log"
-        self.ui_snapshot_path = f"logs/ui_snapshot_{self.session_id}.log"
-        os.makedirs("logs", exist_ok=True)
-        open(self.ui_log_path, "a").close()
-        open(self.ui_snapshot_path, "a").close()
+        self.ui_log_path = None
+        self.ui_snapshot_path = None
+        try:
+            _logs_dir = os.path.join(self._storage_dir, "logs")
+            os.makedirs(_logs_dir, exist_ok=True)
+            self.ui_log_path = os.path.join(_logs_dir, f"ui_session_{self.session_id}.log")
+            self.ui_snapshot_path = os.path.join(_logs_dir, f"ui_snapshot_{self.session_id}.log")
+            open(self.ui_log_path, "a").close()
+            open(self.ui_snapshot_path, "a").close()
+        except OSError:
+            self.log.add(f"[WARN] cannot create logs in {self._storage_dir}")
 
-        if os.path.exists(".cookies/playwright"):
+        if os.path.exists(os.path.join(self._storage_dir, ".cookies", "playwright")):
             self.log.add("[INFO] Saved cookies found, will auto-restore session...")
             t = threading.Thread(target=self._try_restore_session, daemon=True)
             t.start()
@@ -1598,19 +1608,27 @@ class App:
     # ── UI logging / snapshots ──
 
     def log_ui_event(self, event):
+        if not self.ui_log_path:
+            return
         ts = datetime.now().isoformat()
         line = f"[{ts}] EVENT [source=ui] {event}"
-        with open(self.ui_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        try:
+            with open(self.ui_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def save_ui_snapshot(self, content):
-        ts = datetime.now().isoformat()
-        with open(self.ui_snapshot_path, "a", encoding="utf-8") as f:
-            f.write(f"\n===== SNAPSHOT START [{ts}] =====\n")
-            f.write(content + "\n")
-            f.write(f"===== SNAPSHOT END [{ts}] =====\n")
-        self.log.add(f"[INFO] snapshot → {self.ui_snapshot_path}")
-        self._push_log(f"snapshot → {self.ui_snapshot_path}")
+        if self.ui_snapshot_path:
+            try:
+                with open(self.ui_snapshot_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n===== SNAPSHOT START [{datetime.now().isoformat()}] =====\n")
+                    f.write(content + "\n")
+                    f.write(f"===== SNAPSHOT END [{datetime.now().isoformat()}] =====\n")
+                self.log.add(f"[INFO] snapshot → {self.ui_snapshot_path}")
+                self._push_log(f"snapshot → {self.ui_snapshot_path}")
+            except OSError:
+                pass
 
     def _write_model(self, model, writer, label, chat_order):
         path = writer.write(model, chat_order=chat_order)
@@ -1704,4 +1722,7 @@ if __name__ == "__main__":
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bundled_browsers
     _install_stderr_logging()
     app = App()
-    webview.start(debug=False, icon='ui/icon.ico')
+    icon_path = os.path.join(getattr(sys, "_MEIPASS", exe_dir), "ui", "icon.ico")
+    if not os.path.isfile(icon_path):
+        icon_path = "ui/icon.ico"
+    webview.start(debug=False, icon=icon_path)

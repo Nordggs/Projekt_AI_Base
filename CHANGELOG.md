@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.5 — Installed (Program Files) startup fix (2026-08-12)
+
+### Fixed
+- **Установленная версия не запускалась из Program Files**: `os.makedirs("logs")` в `App.__init__` создавал папку в текущей рабочей директории → `PermissionError [WinError 5]` при отсутствии прав записи. Теперь все пользовательские файлы пишутся в единый storage:
+  - `logs/ui_session_*.log`, `logs/ui_snapshot_*.log` → `%LOCALAPPDATA%\AIChatExporter\logs\` (или рядом с exe, если каталог писабелен)
+  - `save_log()` (дамп при Stop) → `%LOCALAPPDATA%\AIChatExporter\logs\debug_*.log`
+  - проверка сохранённых сессий `.cookies/playwright` → `%LOCALAPPDATA%\AIChatExporter\.cookies\playwright`
+- Проведён аудит `main.py`: все обязательные записи используют абсолютные пути (`_storage_dir`, `_output_dir`, `_config_path`); относительных к cwd путей в критичном коде не осталось.
+- **Иконка окна** в frozen-сборке теперь берётся из bundled `ui/icon.ico` (`sys._MEIPASS`), а не из cwd.
+
+### Changed
+- `log_ui_event` / `save_ui_snapshot` устойчивы к недоступному каталогу логов (не роняют приложение).
+
+---
+
 ## v0.5.4 — Help text fix (2026-08-12)
 
 ### Changed
